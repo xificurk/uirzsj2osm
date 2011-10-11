@@ -1,0 +1,1 @@
+Pracovní adresář pro data k importu.
