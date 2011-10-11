@@ -1,0 +1,5 @@
+*.pyc
+/uir-zsj/*.DBF
+/import/*.osm
+/tmp/*.osm
+/credentials.txt
