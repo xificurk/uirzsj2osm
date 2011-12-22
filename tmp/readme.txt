@@ -1,0 +1,1 @@
+Pracovní adresář pro stažená data.
