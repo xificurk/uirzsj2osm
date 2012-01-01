@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-Osmt is a set of tools for accessing and manipulating OSM data via (Overpass) API.
+Osmapis is a set of tools for accessing and manipulating OSM data via OSM API,
+Overpass API, Quick History Service.
+
+Variables:
+    wrappers        --- Dictionary containing the classes to use for OSM element wrappers.
 
 Classes:
-    QHS             --- Interface for Quick History Service.
+    QHS             --- Quick History Service interface.
     OverpassAPI     --- OSM Overpass API interface.
     API             --- OSM API interface.
     HTTPClient      --- Interface for accessing data over HTTP.
-    NullCache       --- Null dummy cache.
-    FileCache       --- Cache that stores data as files in a designated directory.
     Node            --- Node wrapper.
     Way             --- Way wrapper.
     Relation        --- Relation wrapper.
@@ -23,12 +25,11 @@ __author__ = "Petr Morávek (xificurk@gmail.com)"
 __copyright__ = "Copyright (C) 2010 Petr Morávek"
 __license__ = "LGPL 3.0"
 
-__version__ = "0.7.2"
+__version__ = "0.8.0"
 
-from abc import ABCMeta, abstractmethod, abstractproperty
+from abc import ABCMeta, abstractmethod
 from base64 import b64encode
 from collections import MutableSet, MutableMapping
-from hashlib import sha1
 from itertools import chain
 import logging
 import os
@@ -45,12 +46,11 @@ except ImportError:
     from urllib import unquote, urlencode
 
 
-__all__ = ["QHS",
+__all__ = ["wrappers",
+           "QHS",
            "OverpassAPI",
            "API",
            "HTTPClient",
-           "NullCache",
-           "FileCache",
            "Node",
            "Way",
            "Relation",
@@ -60,7 +60,7 @@ __all__ = ["QHS",
            "APIError"]
 
 
-logging.getLogger('osmt').addHandler(logging.NullHandler())
+logging.getLogger('osmapis').addHandler(logging.NullHandler())
 
 
 ############################################################
@@ -72,10 +72,10 @@ class HTTPClient(object):
     Interface for accessing data over HTTP.
 
     Attributes:
-        headers         --- Default headers for HTTP request.
+        headers     --- Default headers for HTTP request.
 
     Methods:
-        request     --- HTTP request.
+        request     --- Perform HTTP request and handle possible redirection, on error retry.
 
     """
 
@@ -83,8 +83,8 @@ class HTTPClient(object):
         raise TypeError("This class cannot be instantionalized.")
 
     headers = {}
-    headers["User-agent"] = "osmt/{0}".format(__version__)
-    log = logging.getLogger("osmt.http")
+    headers["User-agent"] = "osmapis/{0}".format(__version__)
+    log = logging.getLogger("osmapis.http")
 
     @classmethod
     def request(cls, server, path, method="GET", headers={}, payload=None, retry=10):
@@ -105,7 +105,7 @@ class HTTPClient(object):
             retry       --- Number of re-attempts on error.
 
         """
-        cls.log.debug("{}({}) {}{} << {}".format(method, retry, server, path, payload is not None))
+        cls.log.debug("{}({}) {}{} << payload {}".format(method, retry, server, path, payload is not None))
         req_headers = dict(cls.headers)
         req_headers.update(headers)
         if payload is not None and not isinstance(payload, bytes):
@@ -119,7 +119,7 @@ class HTTPClient(object):
             connection.close()
             if server == OverpassAPI.server and response.getheader("Content-Type") != "application/osm3s+xml":
                 # Overpass API returns always status 200, grr!
-                raise APIError(response.status, "Unexpected Content-type {}".format(response.getheader("Content-Type")), body.decode("utf-8", "replace").strip())
+                raise APIError("Unexpected Content-type {}".format(response.getheader("Content-Type")), payload)
             return body
         elif response.status in (301, 302, 303, 307):
             # Try to redirect
@@ -127,7 +127,7 @@ class HTTPClient(object):
             url = response.getheader("Location")
             if url is None:
                 cls.log.error("Got code {}, but no location header.".format(response.status))
-                raise APIError(response.status, response.reason, "")
+                raise APIError("Unable to redirect the request.", payload)
             url = unquote(url)
             cls.log.debug("Redirecting to {}".format(url))
             url = url.split("/", 3)
@@ -135,15 +135,16 @@ class HTTPClient(object):
             path = "/" + url[3]
             return cls.request(server, path, method=method, headers=headers, payload=payload, retry=retry)
         elif 400 <= response.status < 500:
+            body = response.read().decode("utf-8", "replace").strip()
             connection.close()
-            cls.log.error("Could not find {}{}".format(server, path))
-            raise APIError(response.status, response.reason, "")
+            cls.log.error("Got error {} ({}).".format(response.reason, response.status))
+            raise APIError(body, payload)
         else:
             body = response.read().decode("utf-8", "replace").strip()
             connection.close()
             if retry <= 0:
                 cls.log.error("Could not download {}{}".format(server, path))
-                raise APIError(response.status, response.reason, body)
+                raise APIError("Got error {} ({}).".format(response.reason, response.status), payload)
             else:
                 wait = 30
                 cls.log.warn("Got error {} ({})... will retry in {} seconds.".format(response.status, response.reason, wait))
@@ -162,28 +163,28 @@ class BaseReadAPI(object):
     Abstract class for read-only API operations.
 
     Abstract methods:
-        get_bbox            --- OSM bbox download.
-        get_element         --- Download OSM primitive by type, id and optionally version.
-        get_element_full    --- Download OSM primitive by type, id and all primitives that references.
-        get_elements        --- Download OSM primitives by type, ids.
-        get_element_rels    --- Download Relations that reference OSM primitive.
-        get_node_ways       --- Download Ways that reference Node by id or wrapper.
+        get_bbox            --- Download OSM data inside the specified bbox.
+        get_element         --- Download node/way/relation by id and optionally version.
+        get_element_full    --- Download way/relation by id and all elements that references.
+        get_elements        --- Download nodes/ways/relations by ids.
+        get_element_rels    --- Download relations that reference the node/way/relation by id.
+        get_node_ways       --- Download ways that reference the node by id or wrapper.
 
     Methods:
-        get_node            --- Download Node by id and optionally version.
-        get_way             --- Download Way by id and optionally version.
-        get_relation        --- Download Relation by id and optionally version.
-        get_history         --- Download complete history of OSM primitive wrapper.
-        get_way_full        --- Download Way by id and all referenced nodes.
-        get_relation_full   --- Download Relation by id and all referenced members.
-        get_full            --- Download OSM primitive and all primitives that references.
-        get_nodes           --- Download Nodes by ids.
-        get_ways            --- Download Ways by ids.
-        get_relations       --- Download Relations by ids.
-        get_node_rels       --- Download Relations that reference Node.
-        get_way_rels        --- Download Relations that reference Way.
-        get_relation_rels   --- Download Relations that reference Relation.
-        get_rels            --- Download Relations that reference OSM primitive wrapper.
+        get_node            --- Download node by id and optionally version.
+        get_way             --- Download way by id and optionally version.
+        get_relation        --- Download relation by id and optionally version.
+        get_history         --- Download complete history of Node/Way/Relation wrapper.
+        get_way_full        --- Download way by id and all referenced nodes.
+        get_relation_full   --- Download relation by id and all referenced members.
+        get_full            --- Download way/relation and all elements that references.
+        get_nodes           --- Download nodes by ids.
+        get_ways            --- Download ways by ids.
+        get_relations       --- Download relations by ids.
+        get_node_rels       --- Download relations that reference the node by id or wrapper.
+        get_way_rels        --- Download relations that reference the way by id or wrapper.
+        get_relation_rels   --- Download relations that reference the relation by id or wrapper.
+        get_rels            --- Download relations that reference the Node/Way/Relation wrapper.
 
     """
     __metaclass_ = ABCMeta
@@ -191,9 +192,9 @@ class BaseReadAPI(object):
     @abstractmethod
     def get_bbox(self, left, bottom, right, top):
         """
-        OSM bbox download.
+        Download OSM data inside the specified bbox.
 
-        Return OSM instance.
+        Return OSM wrapper.
 
         Arguments:
             left        --- Left boundary.
@@ -207,102 +208,98 @@ class BaseReadAPI(object):
     @abstractmethod
     def get_element(self, type_, id_, version=None):
         """
-        Download OSM primitive by type, id and optionally version.
+        Download node/way/relation by id and optionally version.
 
-        Return Node/Way/Relation instance.
+        Return Node/Way/Relation wrapper.
 
         Arguments:
-            type_       --- OSM primitive type.
-            id_         --- OSM primitive id.
+            type_       --- Element type (node/way/relation).
+            id_         --- Element id.
 
         Keyworded arguments:
-            version     --- OSM primitive version number, None (latest), or
-                            '*' (complete history).
+            version     --- Element version number, None (latest), or '*' (complete history).
 
         """
         raise NotImplementedError
 
     def get_node(self, id_, version=None):
         """
-        Download Node by id and optionally version.
+        Download node by id and optionally version.
 
-        Return Node instance.
+        Return Node wrapper.
 
         Arguments:
             id_         --- Node id.
 
         Keyworded arguments:
-            version     --- Node version number, None (latest), or
-                            '*' (complete history).
+            version     --- Node version number, None (latest), or '*' (complete history).
 
         """
         return self.get_element("node", id_, version=version)
 
     def get_way(self, id_, version=None):
         """
-        Download Way by id and optionally version.
+        Download way by id and optionally version.
 
-        Return Way instance.
+        Return Way wrapper.
 
         Arguments:
             id_         --- Way id.
 
         Keyworded arguments:
-            version     --- Way version number, None (latest), or
-                            '*' (complete history).
+            version     --- Way version number, None (latest), or '*' (complete history).
 
         """
         return self.get_element("way", id_, version=version)
 
     def get_relation(self, id_, version=None):
         """
-        Download Relation by id.
+        Download relation by id and optionally version.
 
-        Return Relation instance.
+        Return Relation wrapper.
 
         Arguments:
             id_         --- Relation id.
 
         Keyworded arguments:
-            version     --- Relation version number, None (latest), or
-                            '*' (complete history).
+            version     --- Relation version number, None (latest), or '*' (complete history).
 
         """
         return self.get_element("relation", id_, version=version)
 
     def get_history(self, element):
         """
-        Download complete history of OSM primitive.
+        Download complete history of Node/Way/Relation wrapper.
 
-        Return Node/Way/Relation instance.
+        Return Node/Way/Relation wrapper.
 
         Arguments:
-            element     --- Node/Way/Relation instance.
+            element     --- Node/Way/Relation wrapper.
 
         """
         if not isinstance(element, (Node, Way, Relation)):
             raise TypeError("Element must be a Node, Way or Relation instance.")
-        return self.get_element(element.TAG_NAME(), element.id, version="*")
+        return self.get_element(element.xml_tag, element.id, version="*")
 
     @abstractmethod
     def get_element_full(self, type_, id_):
         """
-        Download OSM primitive by type, id and all primitives that references.
+        Download way/relation by id and all elements that references.
 
-        Return OSM instance.
+        Return OSM wrapper.
 
         Arguments:
-            type_       --- OSM primitive type.
-            id_         --- OSM primitive id.
+            type_       --- Element type (way/relation).
+            id_         --- Element id.
 
         """
         raise NotImplementedError
 
     def get_way_full(self, id_):
         """
-        Download Way by id and all referenced nodes.
+        Download way by id and all referenced nodes.
 
-        Return OSM instance.
+        Return OSM wrapper.
 
         Arguments:
             id_         --- Way id.
@@ -312,9 +309,9 @@ class BaseReadAPI(object):
 
     def get_relation_full(self, id_):
         """
-        Download Way by id and all referenced members.
+        Download way by id and all referenced members.
 
-        Return OSM instance.
+        Return OSM wrapper.
 
         Arguments:
             id_         --- Relation id.
@@ -324,27 +321,27 @@ class BaseReadAPI(object):
 
     def get_full(self, element):
         """
-        Download OSM primitive and all primitives that references.
+        Download way/relation and all elements that references.
 
-        Return OSM instance.
+        Return OSM wrapper.
 
         Arguments:
-            element     --- Node/Way/Relation instance.
+            element     --- Way/Relation wrapper.
 
         """
-        if not isinstance(element, (Node, Way, Relation)):
-            raise TypeError("Element must be a Node, Way or Relation instance.")
-        return self.get_element_full(element.TAG_NAME(), element.id)
+        if not isinstance(element, (Way, Relation)):
+            raise TypeError("Element must be a Way or Relation instance.")
+        return self.get_element_full(element.xml_tag, element.id)
 
     @abstractmethod
     def get_elements(self, type_, ids):
         """
-        Download OSM primitives by type, ids.
+        Download nodes/ways/relations by ids.
 
-        Return OSM instance.
+        Return OSM wrapper.
 
         Arguments:
-            type_       --- OSM primitive type.
+            type_       --- Elements type (node/way/relation).
             ids         --- Iterable with ids.
 
         """
@@ -352,9 +349,9 @@ class BaseReadAPI(object):
 
     def get_nodes(self, ids):
         """
-        Download Nodes by ids.
+        Download nodes by ids.
 
-        Return OSM instance.
+        Return OSM wrapper.
 
         Arguments:
             ids         --- Iterable with ids.
@@ -364,9 +361,9 @@ class BaseReadAPI(object):
 
     def get_ways(self, ids):
         """
-        Download Ways by ids.
+        Download ways by ids.
 
-        Return OSM instance.
+        Return OSM wrapper.
 
         Arguments:
             ids         --- Iterable with ids.
@@ -376,9 +373,9 @@ class BaseReadAPI(object):
 
     def get_relations(self, ids):
         """
-        Download Relations by ids.
+        Download relations by ids.
 
-        Return OSM instance.
+        Return OSM wrapper.
 
         Arguments:
             ids         --- Iterable with ids.
@@ -389,73 +386,79 @@ class BaseReadAPI(object):
     @abstractmethod
     def get_element_rels(self, type_, id_):
         """
-        Download Relations that reference OSM primitive.
+        Download relations that reference the node/way/relation by id.
 
-        Return OSM instance.
+        Return OSM wrapper.
 
         Arguments:
-            type_       --- OSM primitive type.
-            id_         --- OSM primitive id.
+            type_       --- Element type (node/way/relation).
+            id_         --- Element id.
 
         """
         raise NotImplementedError
 
-    def get_node_rels(self, id_):
+    def get_node_rels(self, element):
         """
-        Download Relations that reference Node.
+        Download relations that reference the node by id or wrapper.
 
-        Return OSM instance.
+        Return OSM wrapper.
 
         Arguments:
-            id_         --- Node id.
+            element     --- Node wrapper or id.
 
         """
-        return self.get_element_rels("node", id_)
+        if isinstance(element, Node):
+            element = element.id
+        return self.get_element_rels("node", element)
 
-    def get_way_rels(self, ids):
+    def get_way_rels(self, element):
         """
-        Download Relations that reference Way.
+        Download relations that reference the way by id or wrapper.
 
-        Return OSM instance.
+        Return OSM wrapper.
 
         Arguments:
-            id_         --- Way id.
+            element     --- Way wrapper or id.
 
         """
-        return self.get_element_rels("way", ids)
+        if isinstance(element, Way):
+            element = element.id
+        return self.get_element_rels("way", element)
 
-    def get_relation_rels(self, id_):
+    def get_relation_rels(self, element):
         """
-        Download Relations that reference Relation.
+        Download relations that reference the relation by id or wrapper.
 
-        Return OSM instance.
+        Return OSM wrapper.
 
         Arguments:
-            id_         --- Relation id.
+            element     --- Relation wrapper or id.
 
         """
-        return self.get_element_rels("relation", ids)
+        if isinstance(element, Relation):
+            element = element.id
+        return self.get_element_rels("relation", element)
 
     def get_rels(self, element):
         """
-        Download Relations that reference OSM primitive wrapper.
+        Download relations that reference the Node/Way/Relation wrapper.
 
-        Return OSM instance.
+        Return OSM wrapper.
 
         Arguments:
-            element     --- Node/Way/Relation instance.
+            element     --- Node/Way/Relation wrapper.
 
         """
         if not isinstance(element, (Node, Way, Relation)):
             raise TypeError("Element must be a Node, Way or Relation instance.")
-        return self.get_element_rels(element.TAG_NAME(), element.id)
+        return self.get_element_rels(element.xml_tag, element.id)
 
     @abstractmethod
     def get_node_ways(self, element):
         """
-        Download Ways that reference Node by id or wrapper.
+        Download ways that reference the node by id or wrapper.
 
-        Return OSM instance.
+        Return OSM wrapper.
 
         Arguments:
             element     --- Node wrapper or id.
@@ -469,25 +472,25 @@ class BaseWriteAPI(object):
     Abstract class for write API operations.
 
     Abstract methods:
-        upload_diff         --- Diff upload.
-        create_element      --- Create OSM primitive.
-        update_element      --- Update OSM primitive.
-        delete_element      --- Delete OSM primitive.
-        delete_elements     --- Delete OSM primitives by type and ids.
+        upload_diff         --- OSC diff upload.
+        create_element      --- Create node/way/relation.
+        update_element      --- Update node/way/relation.
+        delete_element      --- Delete node/way/relation.
+        delete_elements     --- Delete nodes/ways/relations by ids.
 
     Methods:
-        create_node         --- Create Node.
-        create_way          --- Create Way.
-        create_relation     --- Create Relation.
-        update_node         --- Update Node.
-        update_way          --- Update Way.
-        update_relation     --- Update Relation.
-        delete_node         --- Delete Node.
-        delete_way          --- Delete Way.
-        delete_relation     --- Delete Relation.
-        delete_nodes        --- Delete Nodes by ids.
-        delete_ways         --- Delete Ways by ids.
-        delete_relations    --- Delete Relations by ids.
+        create_node         --- Create node.
+        create_way          --- Create way.
+        create_relation     --- Create relation.
+        update_node         --- Update node.
+        update_way          --- Update way.
+        update_relation     --- Update relation.
+        delete_node         --- Delete node.
+        delete_way          --- Delete way.
+        delete_relation     --- Delete relation.
+        delete_nodes        --- Delete nodes by ids.
+        delete_ways         --- Delete ways by ids.
+        delete_relations    --- Delete relations by ids.
 
     """
     __metaclass_ = ABCMeta
@@ -495,15 +498,15 @@ class BaseWriteAPI(object):
     @abstractmethod
     def upload_diff(self, osc, changeset=None):
         """
-        Diff upload.
+        OSC diff upload.
 
         Return {type: {old_id: returned_data} }
 
         Arguments:
-            osc         --- OSC instance.
+            osc         --- OSC wrapper.
 
         Keyworded arguments:
-            changeset   --- Changeset instance, changeset id or None (create new).
+            changeset   --- Changeset wrapper, changeset id or None (create new).
 
         """
         raise NotImplementedError
@@ -511,30 +514,30 @@ class BaseWriteAPI(object):
     @abstractmethod
     def create_element(self, element, changeset=None):
         """
-        Create OSM primitive.
+        Create node/way/relation.
 
-        Return Node/Way/Relation instance.
+        Return Node/Way/Relation wrapper.
 
         Arguments:
-            element     --- Node/Way/Relation instance.
+            element     --- Node/Way/Relation wrapper.
 
         Keyworded arguments:
-            changeset   --- Changeset instance, changeset id or None (create new).
+            changeset   --- Changeset wrapper, changeset id or None (create new).
 
         """
         raise NotImplementedError
 
     def create_node(self, element, changeset=None):
         """
-        Create Node.
+        Create node.
 
-        Return Node instance.
+        Return Node wrapper.
 
         Arguments:
-            element     --- Node instance.
+            element     --- Node wrapper.
 
         Keyworded arguments:
-            changeset   --- Changeset instance, changeset id or None (create new).
+            changeset   --- Changeset wrapper, changeset id or None (create new).
 
         """
         if not isinstance(element, Node):
@@ -543,15 +546,15 @@ class BaseWriteAPI(object):
 
     def create_way(self, element, changeset=None):
         """
-        Create Way.
+        Create way.
 
-        Return Way instance.
+        Return Way wrapper.
 
         Arguments:
-            element     --- Way instance.
+            element     --- Way wrapper.
 
         Keyworded arguments:
-            changeset   --- Changeset instance, changeset id or None (create new).
+            changeset   --- Changeset wrapper, changeset id or None (create new).
 
         """
         if not isinstance(element, Way):
@@ -560,15 +563,15 @@ class BaseWriteAPI(object):
 
     def create_relation(self, element, changeset=None):
         """
-        Create Relation.
+        Create relation.
 
-        Return Relation instance.
+        Return Relation wrapper.
 
         Arguments:
-            element     --- Relation instance.
+            element     --- Relation wrapper.
 
         Keyworded arguments:
-            changeset   --- Changeset instance, changeset id or None (create new).
+            changeset   --- Changeset wrapper, changeset id or None (create new).
 
         """
         if not isinstance(element, Relation):
@@ -578,30 +581,30 @@ class BaseWriteAPI(object):
     @abstractmethod
     def update_element(self, element, changeset=None):
         """
-        Update OSM primitive.
+        Update node/way/relation.
 
-        Return Node/Way/Relation instance.
+        Return Node/Way/Relation wrapper.
 
         Arguments:
-            element     --- Node/Way/Relation instance.
+            element     --- Node/Way/Relation wrapper.
 
         Keyworded arguments:
-            changeset   --- Changeset instance, changeset id or None (create new).
+            changeset   --- Changeset wrapper, changeset id or None (create new).
 
         """
         raise NotImplementedError
 
     def update_node(self, element, changeset=None):
         """
-        Update Node.
+        Update node.
 
-        Return Node instance.
+        Return Node wrapper.
 
         Arguments:
-            element     --- Node instance.
+            element     --- Node wrapper.
 
         Keyworded arguments:
-            changeset   --- Changeset instance, changeset id or None (create new).
+            changeset   --- Changeset wrapper, changeset id or None (create new).
 
         """
         if not isinstance(element, Node):
@@ -610,15 +613,15 @@ class BaseWriteAPI(object):
 
     def update_way(self, element, changeset=None):
         """
-        Update Way.
+        Update way.
 
-        Return Way instance.
+        Return Way wrapper.
 
         Arguments:
-            element     --- Way instance.
+            element     --- Way wrapper.
 
         Keyworded arguments:
-            changeset   --- Changeset instance, changeset id or None (create new).
+            changeset   --- Changeset wrapper, changeset id or None (create new).
 
         """
         if not isinstance(element, Way):
@@ -627,15 +630,15 @@ class BaseWriteAPI(object):
 
     def update_relation(self, element, changeset=None):
         """
-        Update Relation.
+        Update relation.
 
-        Return Relation instance.
+        Return Relation wrapper.
 
         Arguments:
-            element     --- Relation instance.
+            element     --- Relation wrapper.
 
         Keyworded arguments:
-            changeset   --- Changeset instance, changeset id or None (create new).
+            changeset   --- Changeset wrapper, changeset id or None (create new).
 
         """
         if not isinstance(element, Relation):
@@ -645,30 +648,30 @@ class BaseWriteAPI(object):
     @abstractmethod
     def delete_element(self, element, changeset=None):
         """
-        Delete OSM primitive.
+        Delete node/way/relation.
 
-        Return Node/Way/Relation instance.
+        Return Node/Way/Relation wrapper.
 
         Arguments:
-            element     --- Node/Way/Relation instance.
+            element     --- Node/Way/Relation wrapper.
 
         Keyworded arguments:
-            changeset   --- Changeset instance, changeset id or None (create new).
+            changeset   --- Changeset wrapper, changeset id or None (create new).
 
         """
         raise NotImplementedError
 
     def delete_node(self, element, changeset=None):
         """
-        Delete Node.
+        Delete node.
 
-        Return Node instance.
+        Return Node wrapper.
 
         Arguments:
-            element     --- Node instance.
+            element     --- Node wrapper.
 
         Keyworded arguments:
-            changeset   --- Changeset instance, changeset id or None (create new).
+            changeset   --- Changeset wrapper, changeset id or None (create new).
 
         """
         if not isinstance(element, Node):
@@ -677,15 +680,15 @@ class BaseWriteAPI(object):
 
     def delete_way(self, element, changeset=None):
         """
-        Delete Way.
+        Delete way.
 
-        Return Way instance.
+        Return Way wrapper.
 
         Arguments:
-            element     --- Way instance.
+            element     --- Way wrapper.
 
         Keyworded arguments:
-            changeset   --- Changeset instance, changeset id or None (create new).
+            changeset   --- Changeset wrapper, changeset id or None (create new).
 
         """
         if not isinstance(element, Way):
@@ -694,40 +697,40 @@ class BaseWriteAPI(object):
 
     def delete_relation(self, element, changeset=None):
         """
-        Delete Relation.
+        Delete relation.
 
-        Return Relation instance.
+        Return Relation wrapper.
 
         Arguments:
-            element     --- Relation instance.
+            element     --- Relation wrapper.
 
         Keyworded arguments:
-            changeset   --- Changeset instance, changeset id or None (create new).
+            changeset   --- Changeset wrapper, changeset id or None (create new).
 
         """
         if not isinstance(relation, Relation):
-            raise TypeError("Relation must be Relation instance or integer.")
+            raise TypeError("Element must be Relation instance.")
         return self.delete_element(element, changeset)
 
     def delete_elements(self, type_, ids, changeset=None):
         """
-        Delete OSM primitives by type and ids.
+        Delete nodes/ways/relations by ids.
 
         Return OSC instance.
 
         Arguments:
-            type_       --- OSM primitive type.
+            type_       --- Element type (node/way/relation).
             ids         --- Iterable of ids.
 
         Keyworded arguments:
-            changeset   --- Changeset instance, changeset id or None (create new).
+            changeset   --- Changeset wrapper, changeset id or None (create new).
 
         """
         raise NotImplementedError
 
     def delete_nodes(self, ids, changeset=None):
         """
-        Delete Nodes by ids.
+        Delete nodes by ids.
 
         Return OSC instance.
 
@@ -735,14 +738,14 @@ class BaseWriteAPI(object):
             ids         --- Iterable of ids.
 
         Keyworded arguments:
-            changeset   --- Changeset instance, changeset id or None (create new).
+            changeset   --- Changeset wrapper, changeset id or None (create new).
 
         """
         return self.delete_elements("node", ids, changeset)
 
     def delete_ways(self, ids, changeset=None):
         """
-        Delete Ways by ids.
+        Delete ways by ids.
 
         Return OSC instance.
 
@@ -750,14 +753,14 @@ class BaseWriteAPI(object):
             ids         --- Iterable of ids.
 
         Keyworded arguments:
-            changeset   --- Changeset instance, changeset id or None (create new).
+            changeset   --- Changeset wrapper, changeset id or None (create new).
 
         """
         return self.delete_elements("way", ids, changeset)
 
     def delete_relations(self, ids, changeset=None):
         """
-        Delete Relations by ids.
+        Delete relations by ids.
 
         Return OSC instance.
 
@@ -765,7 +768,7 @@ class BaseWriteAPI(object):
             ids         --- Iterable of ids.
 
         Keyworded arguments:
-            changeset   --- Changeset instance, changeset id or None (create new).
+            changeset   --- Changeset wrapper, changeset id or None (create new).
 
         """
         return self.delete_elements("relation", ids, changeset)
@@ -774,13 +777,13 @@ class BaseWriteAPI(object):
 
 class QHS(object):
     """
-    Interface for Quick History Service.
+    Quick History Service interface.
 
     Attributes:
         http        --- Interface for accessing data over HTTP.
         server      --- Domain name of QHS.
         basepath    --- Path to the API on the server.
-        version         --- Version of OSM API.
+        version     --- Version of OSM API.
 
     Methods:
         request     --- Low-level method to retrieve data from server.
@@ -810,20 +813,20 @@ class QHS(object):
         """
         Check licensing problems.
 
-        Returns the same type of object as passed in element argument. To each
-        Node, Way and Relation instance will be added 'license' argument
-        containing found problems, or None.
+        Returns the same type of object as passed in element argument. Adds
+        odbl_problems attribute to each Node, Way and Relation wrapper that
+        contains found problems, or None.
 
         Arguments:
-            element     --- Data to check - Node, Way, Relation, or OSM instance.
+            element     --- Data to check - Node, Way, Relation, or OSM wrapper.
 
         """
         if isinstance(element, (Node, Way, Relation)):
-            query = {"{}s".format(element.TAG_NAME()): element.id}
+            query = {"{}s".format(element.xml_tag): element.id}
         elif isinstance(element, OSM):
             query = {}
-            for type_ in ("node", "way", "relation"):
-                query["{}s".format(type_)] = ",".join(str(id_) for id_ in getattr(element, type_).keys())
+            for type_ in ("nodes", "ways", "relations"):
+                query[type_] = ",".join(str(id_) for id_ in getattr(element, type_).keys())
         else:
             raise TypeError("Element must be a Node, Way, Relation or OSM instance.")
 
@@ -831,15 +834,15 @@ class QHS(object):
         result = self._parse_problems(result)
         if isinstance(element, (Node, Way, Relation)):
             try:
-                element.license = result[element.TAG_NAME()][element.id]
+                element.odbl_problems = result[element.xml_tag][element.id]
             except KeyError:
-                element.license = None
-        elif isinstance(element, OSM):
+                element.odbl_problems = None
+        else:
             for child in element:
                 try:
-                    child.license = result[child.TAG_NAME()][child.id]
+                    child.odbl_problems = result[child.xml_tag][child.id]
                 except KeyError:
-                    child.license = None
+                    child.odbl_problems = None
         return element
 
     def _parse_problems(self, data):
@@ -867,27 +870,21 @@ class OverpassAPI(BaseReadAPI):
 
     Methods:
         request     --- Low-level method to retrieve data from server.
-        interpreter --- Send request to interpreter and return OSM instance.
+        interpreter --- Send request to interpreter and return OSM wrapper.
 
     Methods (required by BaseReadAPI):
-        get_bbox            --- OSM bbox download.
-        get_element         --- Download OSM primitive by type, id.
-        get_element_full    --- Download OSM primitive by type, id and all primitives that references.
-        get_elements        --- Download OSM primitives by type, ids.
-        get_element_rels    --- Download Relations that reference OSM primitive.
-        get_node_ways       --- Download Ways that reference Node by id or wrapper.
+        get_bbox            --- Download OSM data inside the specified bbox.
+        get_element         --- Download node/way/relation by id and optionally version.
+        get_element_full    --- Download way/relation by id and all elements that references.
+        get_elements        --- Download nodes/ways/relations by ids.
+        get_element_rels    --- Download relations that reference the node/way/relation by id.
+        get_node_ways       --- Download ways that reference the node by id or wrapper.
 
     """
 
     http = HTTPClient
     server = "www.overpass-api.de"
     basepath = "/api/"
-
-    def __init__(self, directory=None):
-        try:
-            self.cache = FileCache(directory)
-        except IOError:
-            self.cache = NullCache()
 
     def request(self, path, data):
         """
@@ -904,29 +901,24 @@ class OverpassAPI(BaseReadAPI):
 
     def interpreter(self, query):
         """
-        Send request to interpreter and return OSM instance.
+        Send request to interpreter and return OSM wrapper.
 
         Arguments:
             query       --- ET.Element or string.
 
         """
         if ET.iselement(query):
-            query = ET.tostring(query)
-        try:
-            data = self.cache[query]
-        except KeyError:
-            data = self.request("interpreter", query)
-            self.cache[query] = data
-        return OSM.from_xml(data)
+            query = ET.tostring(query, encoding="utf-8")
+        return wrappers["osm"].from_xml(self.request("interpreter", query))
 
     ##################################################
     # READ API                                       #
     ##################################################
     def get_bbox(self, left, bottom, right, top):
         """
-        OSM bbox download.
+        Download OSM data inside the specified bbox.
 
-        Return OSM instance.
+        Return OSM wrapper.
 
         Arguments:
             left        --- Left boundary.
@@ -948,15 +940,15 @@ class OverpassAPI(BaseReadAPI):
 
     def get_element(self, type_, id_, version=None):
         """
-        Download OSM primitive by type, id.
+        Download node/way/relation by id and optionally version.
 
         Version and history calls are not supported.
 
-        Return Node/Way/Relation instance.
+        Return Node/Way/Relation wrapper.
 
         Arguments:
-            type_       --- OSM primitive type.
-            id_         --- OSM primitive id.
+            type_       --- Element type (node/way/relation).
+            id_         --- Element id.
 
         Keyworded arguments:
             version     --- For compatibility only, must be None.
@@ -969,17 +961,17 @@ class OverpassAPI(BaseReadAPI):
         query = '<id-query type="{}" ref="{}"/>'.format(type_, id_)
         query += '<print mode="meta"/>'
         osm = self.interpreter(query)
-        return getattr(osm, type_)[id_]
+        return getattr(osm, type_ + "s")[id_]
 
     def get_element_full(self, type_, id_):
         """
-        Download OSM primitive by type, id and all primitives that references.
+        Download way/relation by id and all elements that references.
 
-        Return OSM instance.
+        Return OSM wrapper.
 
         Arguments:
-            type_       --- OSM primitive type.
-            id_         --- OSM primitive id.
+            type_       --- Element type (way/relation).
+            id_         --- Element id.
 
         """
         if type_ not in ("way", "relation"):
@@ -997,12 +989,12 @@ class OverpassAPI(BaseReadAPI):
 
     def get_elements(self, type_, ids):
         """
-        Download OSM primitives by type, ids.
+        Download nodes/ways/relations by ids.
 
-        Return OSM instance.
+        Return OSM wrapper.
 
         Arguments:
-            type_       --- OSM primitive type.
+            type_       --- Elements type (node/way/relation).
             ids         --- Iterable with ids.
 
         """
@@ -1016,13 +1008,13 @@ class OverpassAPI(BaseReadAPI):
 
     def get_element_rels(self, type_, id_):
         """
-        Download Relations that reference OSM primitive.
+        Download relations that reference the node/way/relation by id.
 
-        Return OSM instance.
+        Return OSM wrapper.
 
         Arguments:
-            type_       --- OSM primitive type.
-            id_         --- OSM primitive id.
+            type_       --- Element type (node/way/relation).
+            id_         --- Element id.
 
         """
         if type_ not in ("node", "way", "relation"):
@@ -1037,9 +1029,9 @@ class OverpassAPI(BaseReadAPI):
 
     def get_node_ways(self, element):
         """
-        Download Ways that reference Node by id or wrapper.
+        Download ways that reference the node by id or wrapper.
 
-        Return OSM instance.
+        Return OSM wrapper.
 
         Arguments:
             element     --- Node wrapper or id.
@@ -1062,7 +1054,7 @@ class API(BaseReadAPI, BaseWriteAPI):
 
     Attributes:
         http            --- Interface for accessing data over HTTP.
-        server          --- Domain name of OSM Overpass API.
+        server          --- Domain name of OSM API.
         basepath        --- Path to the API on the server.
         version         --- Version of OSM API.
         username        --- Username for API authentication
@@ -1076,33 +1068,33 @@ class API(BaseReadAPI, BaseWriteAPI):
         delete              --- Low-level method for DELETE request.
         post                --- Low-level method for POST request.
 
-        get_changeset       --- Download Changeset by id.
-        get_changeset_full  --- Download Changeset contents by id.
-        search_changeset    --- Search for Changeset by given parameters.
-        create_changeset    --- Create Changeset.
-        update_changeset    --- Update Changeset.
-        close_changeset     --- Close Changeset.
+        get_changeset       --- Download changeset by id.
+        get_changeset_full  --- Download changeset contents by id.
+        search_changeset    --- Search for changeset by given parameters.
+        create_changeset    --- Create changeset.
+        update_changeset    --- Update changeset.
+        close_changeset     --- Close changeset.
 
     Methods (required by BaseReadAPI):
         get_capabilities    --- Download and return dictionary with OSM API capabilities.
-        get_bbox            --- OSM bbox download.
-        get_element         --- Download OSM primitive by type, id and optionally version.
-        get_element_full    --- Download OSM primitive by type, id and all primitives that references.
-        get_elements        --- Download OSM primitives by type, ids.
-        get_element_rels    --- Download Relations that reference OSM primitive.
-        get_node_ways       --- Download Ways that reference Node by id or wrapper.
+        get_bbox            --- Download OSM data inside the specified bbox.
+        get_element         --- Download node/way/relation by id and optionally version.
+        get_element_full    --- Download way/relation by id and all elements that references.
+        get_elements        --- Download nodes/ways/relations by ids.
+        get_element_rels    --- Download relations that reference the node/way/relation by id.
+        get_node_ways       --- Download ways that reference the node by id or wrapper.
 
     Methods (required by BaseWriteAPI):
-        upload_diff         --- Diff upload.
-        create_element      --- Create OSM primitive.
-        update_element      --- Update OSM primitive.
-        delete_element      --- Delete OSM primitive.
-        delete_elements     --- Delete OSM primitives by type and ids.
+        upload_diff         --- OSC diff upload.
+        create_element      --- Create node/way/relation.
+        update_element      --- Update node/way/relation.
+        delete_element      --- Delete node/way/relation.
+        delete_elements     --- Delete nodes/ways/relations by ids.
 
     """
 
     http = HTTPClient
-    log = logging.getLogger("osmt.api")
+    log = logging.getLogger("osmapis.api")
     _capabilities = None
     _changeset = None
     version = 0.6
@@ -1118,7 +1110,7 @@ class API(BaseReadAPI, BaseWriteAPI):
                                 changeset creation:
                                     'enabled' - Enable auto_changeset (boolean).
                                     'size' - Maximum size of changeset (integer).
-                                    'tag' - Default tags (dictionary).
+                                    'tags' - Default tags (dictionary).
 
         """
         self.username = username
@@ -1127,7 +1119,7 @@ class API(BaseReadAPI, BaseWriteAPI):
             auto_changeset = {}
         auto_changeset.setdefault("enabled", True)
         auto_changeset.setdefault("size", 200)
-        auto_changeset.setdefault("tag", {}).setdefault("created_by", "osmt/{0}".format(__version__))
+        auto_changeset.setdefault("tags", {}).setdefault("created_by", "osmapis/{0}".format(__version__))
         self.auto_changeset = auto_changeset
 
     def __del__(self):
@@ -1142,7 +1134,7 @@ class API(BaseReadAPI, BaseWriteAPI):
         return auto_changeset id (if necessary, create new one).
 
         Keyworded arguments:
-            changeset   --- Changeset instance or changeset id (integer).
+            changeset   --- Changeset wrapper or changeset id (integer).
 
         """
         if isinstance(changeset, Changeset):
@@ -1180,7 +1172,7 @@ class API(BaseReadAPI, BaseWriteAPI):
                 if main_tag_only:
                     for child in element:
                         element.remove(child)
-        return ET.tostring(payload)
+        return ET.tostring(payload, encoding="utf-8")
 
     ##################################################
     # HTTP methods                                   #
@@ -1194,7 +1186,7 @@ class API(BaseReadAPI, BaseWriteAPI):
         Low-level method to retrieve data from server.
 
         Arguments:
-            path        --- One of 'interpreter', 'get_rule', 'add_rule', 'update_rule'.
+            path        --- Path to download from server.
 
         Keyworded arguments:
             payload     --- Data to send with the request.
@@ -1288,35 +1280,35 @@ class API(BaseReadAPI, BaseWriteAPI):
     ##################################################
     def get_changeset(self, id_):
         """
-        Download Changeset by id.
+        Download changeset by id.
 
-        Return Changeset instance.
+        Return Changeset wrapper.
 
         Arguments:
             id_         --- Changeset id.
 
         """
         path = "changeset/{}".format(id_)
-        return Changeset.from_xml(ET.XML(self.get(path)).find("changeset"))
+        return wrappers["changeset"].from_xml(ET.XML(self.get(path)).find("changeset"))
 
     def get_changeset_full(self, id_):
         """
-        Download Changeset contents by id.
+        Download changeset contents by id.
 
-        Return OSC instance.
+        Return OSC wrapper.
 
         Arguments:
             id_         --- Changeset id.
 
         """
         path = "changeset/{}/download".format(id_)
-        return OSC.from_xml(self.get(path))
+        return wrappers["osc"].from_xml(self.get(path))
 
     def search_changeset(self, params):
         """
-        Search for Changeset by given parameters.
+        Search for changeset by given parameters.
 
-        Return list of Changesets.
+        Return list of changesets.
 
         Arguments:
             params          --- Dictionary of parameters: bbox, user or
@@ -1328,55 +1320,55 @@ class API(BaseReadAPI, BaseWriteAPI):
         data = self.get(path)
         result = []
         for element in ET.XML(self.get(path)).findall("changeset"):
-            result.append(Changeset.from_xml(element))
+            result.append(wrappers["changeset"].from_xml(element))
         return result
 
     def create_changeset(self, changeset=None, comment=None):
         """
-        Create Changeset.
+        Create changeset.
 
-        Return Changeset instance.
+        Return Changeset wrapper.
 
         Keyworded arguments:
-            changeset   --- Changeset instance or None (create new).
+            changeset   --- Changeset wrapper or None (create new).
             comment     --- Comment tag.
 
         """
         if changeset is None:
             # No Changset instance provided => create new one
-            tag = dict(self.auto_changeset["tag"])
+            tags = dict(self.auto_changeset["tags"])
             if comment is not None:
-                tag["comment"] = comment
-            changeset = Changeset(tag=tag)
+                tags["comment"] = comment
+            changeset = wrappers["changeset"](tags=tags)
         elif not isinstance(changeset, Changeset):
             raise TypeError("Changeset must be Changeset instance or None.")
-        payload = "<osm>{}</osm>".format(ET.tostring(changeset.to_xml()))
+        payload = "<osm>{}</osm>".format(ET.tostring(changeset.to_xml(), encoding="utf-8"))
         path = "changeset/create"
-        changeset.attrib["id"] = int(self.put(path, payload))
+        changeset.attribs["id"] = int(self.put(path, payload))
         return changeset
 
     def update_changeset(self, changeset):
         """
-        Update Changeset.
+        Update changeset.
 
-        Return updated Changeset instance.
+        Return updated Changeset wrapper.
 
         Arguments:
-            changeset   --- Changeset instance.
+            changeset   --- Changeset wrapper.
 
         """
         if not isinstance(changeset, Changeset):
             raise TypeError("Changeset must be Changeset instance.")
-        payload = "<osm>{}</osm>".format(ET.tostring(changeset.to_xml()))
+        payload = "<osm>{}</osm>".format(ET.tostring(changeset.to_xml(), encoding="utf-8"))
         path = "changeset/{}".format(changeset.id)
-        return Changeset.from_xml(ET.XML(self.put(path, payload)).find("changeset"))
+        return wrappers["changeset"].from_xml(ET.XML(self.put(path, payload)).find("changeset"))
 
     def close_changeset(self, changeset):
         """
-        Close Changeset.
+        Close changeset.
 
         Arguments:
-            changeset   --- Changeset instance or changeset id.
+            changeset   --- Changeset wrapper or changeset id.
 
         """
         # Temporarily disable auto_changeset
@@ -1392,9 +1384,9 @@ class API(BaseReadAPI, BaseWriteAPI):
     ##################################################
     def get_bbox(self, left, bottom, right, top):
         """
-        OSM bbox download.
+        Download OSM data inside the specified bbox.
 
-        Return OSM instance.
+        Return OSM wrapper.
 
         Arguments:
             left        --- Left boundary.
@@ -1404,21 +1396,20 @@ class API(BaseReadAPI, BaseWriteAPI):
 
         """
         path = "map?bbox={},{},{},{}".format(left, bottom, right, top)
-        return OSM.from_xml(self.get(path))
+        return wrappers["osm"].from_xml(self.get(path))
 
     def get_element(self, type_, id_, version=None):
         """
-        Download OSM primitive by type, id and optionally version.
+        Download node/way/relation by id and optionally version.
 
-        Return Node/Way/Relation instance.
+        Return Node/Way/Relation wrapper.
 
         Arguments:
-            type_       --- OSM primitive type.
-            id_         --- OSM primitive id.
+            type_       --- Element type (node/way/relation).
+            id_         --- Element id.
 
         Keyworded arguments:
-            version     --- OSM primitive version number, None (latest), or
-                            '*' (complete history).
+            version     --- Element version number, None (latest), or '*' (complete history).
 
         """
         if type_ not in ("node", "way", "relation"):
@@ -1430,62 +1421,62 @@ class API(BaseReadAPI, BaseWriteAPI):
             path += "/history"
         elif version is not None:
             raise TypeError("Version must be integer, '*' or None.")
-        osm = OSM.from_xml(self.get(path))
-        return getattr(osm, type_)[id_]
+        osm = wrappers["osm"].from_xml(self.get(path))
+        return getattr(osm, type_ + "s")[id_]
 
     def get_element_full(self, type_, id_):
         """
-        Download OSM primitive by type, id and all primitives that references.
+        Download way/relation by id and all elements that references.
 
-        Return OSM instance.
+        Return OSM wrapper.
 
         Arguments:
-            type_       --- OSM primitive type.
-            id_         --- OSM primitive id.
+            type_       --- Element type (way/relation).
+            id_         --- Element id.
 
         """
         if type_ not in ("way", "relation"):
             raise ValueError("Type must be from {}.".format(", ".join(("way", "relation"))))
         path = "{}/{}/full".format(type_, id_)
-        return OSM.from_xml(self.get(path))
+        return wrappers["osm"].from_xml(self.get(path))
 
     def get_elements(self, type_, ids):
         """
-        Download OSM primitives by type, ids.
+        Download nodes/ways/relations by ids.
 
-        Return OSM instance.
+        Return OSM wrapper.
 
         Arguments:
-            type_       --- OSM primitive type.
+            type_       --- Elements type (node/way/relation).
             ids         --- Iterable with ids.
 
         """
         if type_ not in ("node", "way", "relation"):
             raise ValueError("Type must be 'node', 'way' or 'relation'.")
         path = "{0}s?{0}s={1}".format(type_, ",".join((str(id) for id in ids)))
-        return OSM.from_xml(self.get(path))
+        return wrappers["osm"].from_xml(self.get(path))
 
     def get_element_rels(self, type_, id_):
         """
-        Download Relations that reference OSM primitive.
+        Download relations that reference the node/way/relation by id.
 
-        Return OSM instance.
+        Return OSM wrapper.
 
         Arguments:
-            type_       --- OSM primitive type.
-            id_         --- OSM primitive id.
+            type_       --- Element type (node/way/relation).
+            id_         --- Element id.
 
         """
         if type_ not in ("node", "way", "relation"):
             raise ValueError("Type must be 'node', 'way' or 'relation'.")
         path = "{}/{}/relations".format(type_, id_)
-        return OSM.from_xml(self.get(path))
+        return wrappers["osm"].from_xml(self.get(path))
 
     def get_node_ways(self, element):
         """
-        Download Ways that reference Node by id or wrapper.
+        Download ways that reference the node by id or wrapper.
 
-        Return OSM instance.
+        Return OSM wrapper.
 
         Arguments:
             element     --- Node wrapper or id.
@@ -1494,7 +1485,7 @@ class API(BaseReadAPI, BaseWriteAPI):
         if isinstance(element, Node):
             element = element.id
         path = "node/{}/ways".format(element)
-        return OSM.from_xml(self.get(path))
+        return wrappers["osm"].from_xml(self.get(path))
 
 
     ##################################################
@@ -1502,15 +1493,15 @@ class API(BaseReadAPI, BaseWriteAPI):
     ##################################################
     def upload_diff(self, osc, changeset=None):
         """
-        Diff upload.
+        OSC diff upload.
 
         Return {type: {old_id: returned_data} }
 
         Arguments:
-            osc         --- OSC instance.
+            osc         --- OSC wrapper.
 
         Keyworded arguments:
-            changeset   --- Changeset instance, changeset id or None (create new).
+            changeset   --- Changeset wrapper, changeset id or None (create new).
 
         """
         changeset_id = self._changeset_id(changeset)
@@ -1535,92 +1526,92 @@ class API(BaseReadAPI, BaseWriteAPI):
 
     def create_element(self, element, changeset=None):
         """
-        Create OSM primitive.
+        Create node/way/relation.
 
-        Return Node/Way/Relation instance.
+        Return Node/Way/Relation wrapper.
 
         Arguments:
-            element     --- Node/Way/Relation instance.
+            element     --- Node/Way/Relation wrapper.
 
         Keyworded arguments:
-            changeset   --- Changeset instance, changeset id or None (create new).
+            changeset   --- Changeset wrapper, changeset id or None (create new).
 
         """
         if not isinstance(element, (Node, Way, Relation)):
             raise TypeError("Element must be a Node, Way or Relation instance.")
         changeset_id = self._changeset_id(changeset)
-        path = "{}/{}/create".format(element.TAG_NAME(), element.id)
+        path = "{}/{}/create".format(element.xml_tag, element.id)
         payload = "<osm>{}</osm>".format(self._format_payload(element, changeset_id))
         data = self.put(path, payload)
         self._auto_changeset_clear()
-        element.attrib["version"] = int(data)
-        element.attrib["changeset"] = int(changeset_id)
+        element.attribs["version"] = int(data)
+        element.attribs["changeset"] = int(changeset_id)
         element.history = {element.version: element}
         return element
 
     def update_element(self, element, changeset=None):
         """
-        Update OSM primitive.
+        Update node/way/relation.
 
-        Return Node/Way/Relation instance.
+        Return Node/Way/Relation wrapper.
 
         Arguments:
-            element     --- Node/Way/Relation instance.
+            element     --- Node/Way/Relation wrapper.
 
         Keyworded arguments:
-            changeset   --- Changeset instance, changeset id or None (create new).
+            changeset   --- Changeset wrapper, changeset id or None (create new).
 
         """
         if not isinstance(element, (Node, Way, Relation)):
             raise TypeError("Element must be a Node, Way or Relation instance.")
         changeset_id = self._changeset_id(changeset)
-        path = "{}/{}".format(element.TAG_NAME(), element.id)
+        path = "{}/{}".format(element.xml_tag, element.id)
         payload = "<osm>{}</osm>".format(self._format_payload(element, changeset_id))
         data = self.put(path, payload)
         self._auto_changeset_clear()
-        element.attrib["version"] = int(data)
-        element.attrib["changeset"] = int(changeset_id)
+        element.attribs["version"] = int(data)
+        element.attribs["changeset"] = int(changeset_id)
         element.history = {element.version: element}
         return element
 
     def delete_element(self, element, changeset=None):
         """
-        Delete OSM primitive.
+        Delete node/way/relation.
 
-        Return Node/Way/Relation instance.
+        Return Node/Way/Relation wrapper.
 
         Arguments:
-            element     --- Node/Way/Relation instance.
+            element     --- Node/Way/Relation wrapper.
 
         Keyworded arguments:
-            changeset   --- Changeset instance, changeset id or None (create new).
+            changeset   --- Changeset wrapper, changeset id or None (create new).
 
         """
         if not isinstance(element, (Node, Way, Relation)):
             raise TypeError("Element must be a Node, Way or Relation instance.")
         changeset_id = self._changeset_id(changeset)
-        path = "{}/{}".format(element.TAG_NAME(), element.id)
+        path = "{}/{}".format(element.xml_tag, element.id)
         payload = "<osm>{}</osm>".format(self._format_payload(element, changeset_id, main_tag_only=True))
         data = self.delete(path, payload)
         self._auto_changeset_clear()
-        element.attrib["visible"] = False
-        element.attrib["version"] = int(data)
-        element.attrib["changeset"] = int(changeset_id)
+        element.attribs["visible"] = False
+        element.attribs["version"] = int(data)
+        element.attribs["changeset"] = int(changeset_id)
         element.history = {element.version: element}
         return element
 
     def delete_elements(self, type_, ids, changeset=None):
         """
-        Delete OSM primitives by type and ids.
+        Delete nodes/ways/relations by ids.
 
         Return OSC instance.
 
         Arguments:
-            type_       --- OSM primitive type.
+            type_       --- Element type (node/way/relation).
             ids         --- Iterable of ids.
 
         Keyworded arguments:
-            changeset   --- Changeset instance, changeset id or None (create new).
+            changeset   --- Changeset wrapper, changeset id or None (create new).
 
         """
         if type_ not in ("node", "way", "relation"):
@@ -1628,85 +1619,78 @@ class API(BaseReadAPI, BaseWriteAPI):
         delete = []
         for element in self.get_elements(type_, ids):
             delete.append(self.delete_element(element, changeset))
-        return OSC(delete=delete)
-
-
-
-############################################################
-### Cache for Overpass API requests.                     ###
-############################################################
-
-class NullCache(object):
-    """
-    Null dummy cache.
-
-    """
-
-    def __getitem__(self, key):
-        raise KeyError
-
-    def __setitem__(self, key, value):
-        pass
-
-    def __delitem__(self, key):
-        pass
-
-
-class FileCache(NullCache):
-    """
-    Cache that stores data as files in a designated directory.
-
-    Attributes:
-        directory       --- Directory for storing cache files.
-        suffix          --- Suffix of cache files.
-
-    """
-
-    suffix = ".osm.cache"
-
-    def __init__(self, directory):
-        """
-        Raise IOError if the passed directory is invalid.
-
-        Arguments:
-            directory   --- Directory for storing cache files.
-
-        """
-        if directory is None or not os.path.isdir(directory):
-            raise IOError((1, "Directory not found.", directory))
-        self.directory = directory
-
-    def get_filename(self, key):
-        if not isinstance(key, bytes):
-            key = key.encode("utf-8")
-        return sha1(key).hexdigest() + self.suffix
-
-    def get_filepath(self, key):
-        return os.path.join(self.directory, self.get_filename(key))
-
-    def __getitem__(self, key):
-        path = self.get_filepath(key)
-        if not os.path(path):
-            raise KeyError
-        with open(path) as fp:
-            return fp.read()
-
-    def __setitem__(self, key, value):
-        path = self.get_filepath(key)
-        with open(path, "w") as fp:
-            fp.write(value)
-
-    def __delitem__(self, key):
-        path = self.get_filepath(key)
-        if not os.path(path):
-            raise KeyError
-        os.remove(path)
+        return wrappers["osc"](delete=delete)
 
 
 
 ############################################################
 ### Wrappers for OSM Elements and documents.             ###
 ############################################################
+
+class XMLFile(object):
+    """
+    Abstract wrapper for XML Elements.
+
+    Abstract methods:
+        to_xml          --- Get ET.Element representation of wrapper.
+        from_xml        --- Create wrapper from XML representation.
+
+    Class methods:
+        load            --- Load the wrapper from file.
+
+    Methods:
+        save            --- Save the wrapper into file.
+
+    """
+
+    __metaclass__ = ABCMeta
+
+    @abstractmethod
+    def from_xml(cls, data):
+        """
+        Create wrapper from XML representation.
+
+        Arguments:
+            data    --- ET.Element or XML string.
+
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def to_xml(self, strip=()):
+        """
+        Get ET.Element representation of wrapper.
+
+        Keyworded arguments:
+            strip       --- Attributes that should be filtered out.
+
+        """
+        raise NotImplementedError
+
+    def save(self, filename):
+        """
+        Save the wrapper into file.
+
+        Arguments:
+            filename        --- Filename where to save the wrapper.
+
+        """
+        with open(filename, "w") as fp:
+            fp.write('<?xml version="1.0" encoding="UTF-8"?>')
+            fp.write(ET.tostring(self.to_xml(), encoding="utf-8"))
+
+    @classmethod
+    def load(cls, filename):
+        """
+        Load the wrapper from file.
+
+        Arguments:
+            filename        --- Filename from where to load the wrapper.
+
+        """
+        with open(filename) as fp:
+            return cls.from_xml(fp.read())
+
 
 class XMLElement(object):
     """
@@ -1772,26 +1756,28 @@ class XMLElement(object):
         for key, value in data.items():
             if key in strip:
                 continue
-            attribs[key] = str(value)
-            if isinstance(value, bool):
-                attribs[key] = attribs[key].lower()
+            if isinstance(value, (int, float)):
+                attribs[key] = str(value)
+            elif isinstance(value, bool):
+                attribs[key] = str(value).lower()
+            else:
+                attribs[key] = value
         return attribs
 
 
 class OSMElement(XMLElement):
     """
-    Abstract wrapper for OSM primitives and changeset.
+    Abstract wrapper for node, way, relation and changeset.
 
     Class methods:
-        TAG_NAME    --- Tag name of the OSMElement.
-        parse_tags  --- Extract tags of OSM primitive or changeset from ET.Element.
+        parse_tags  --- Extract tags from ET.Element.
 
     Properties:
-        id          --- Id of OSM primitive or changeset, read-only.
+        id          --- Id of wrapper, read-only.
 
     Attributes:
-        attrib      --- Attributes of OSM primitive or changeset.
-        tag         --- Tags of OSM primitive or changeset.
+        attribs     --- Attributes of wrapper.
+        tags        --- Tags of wrapper.
 
     Methods:
         to_xml      --- Get ET.Element representation of wrapper.
@@ -1799,14 +1785,9 @@ class OSMElement(XMLElement):
     """
 
     @classmethod
-    def TAG_NAME(cls):
-        """ get tag name of the element """
-        return cls.__name__.lower()
-
-    @classmethod
     def parse_tags(cls, element):
         """
-        Extract tags of OSM primitive or changeset from ET.Element.
+        Extract tags from ET.Element.
 
         Arguments:
             element     --- ET.Element instance.
@@ -1821,12 +1802,12 @@ class OSMElement(XMLElement):
 
     @property
     def id(self):
-        """ id of OSM primitive or changeset """
-        return self.attrib.get("id")
+        """ id of wrapper """
+        return self.attribs.get("id")
 
-    def __init__(self, attrib={}, tag={}):
-        self.attrib = dict(attrib)
-        self.tag = dict(tag)
+    def __init__(self, attribs={}, tags={}):
+        self.attribs = dict(attribs)
+        self.tags = dict(tags)
 
     def to_xml(self, strip=()):
         """
@@ -1836,22 +1817,22 @@ class OSMElement(XMLElement):
             strip       --- Attributes that should be filtered out.
 
         """
-        attrib = self.unparse_attribs(self.attrib, strip=strip)
-        element = ET.Element(self.TAG_NAME(), attrib)
-        for key in sorted(self.tag.keys()):
-            ET.SubElement(element, "tag", {"k": key, "v": self.tag[key]})
+        attribs = self.unparse_attribs(self.attribs, strip=strip)
+        element = ET.Element(self.xml_tag, attribs)
+        for key in sorted(self.tags.keys()):
+            ET.SubElement(element, "tag", {"k": key, "v": self.tags[key]})
         return element
 
 
 class OSMPrimitive(OSMElement):
     """
-    Abstract wrapper for Node, Way and Relation.
+    Abstract wrapper for node, way and relation.
 
     Properties:
-        version     --- Version of OSM primitive, read-only.
+        version     --- Version of node/way/relation, read-only.
 
     Attributes:
-        history     --- Dictionary containing old versions of OSM primitive.
+        history     --- Dictionary containing old versions of node/way/relation.
 
     Methods:
         merge_history   --- Merge history of other wrapper into self.
@@ -1860,11 +1841,11 @@ class OSMPrimitive(OSMElement):
 
     @property
     def version(self):
-        """ version of OSM primitive """
-        return self.attrib.get("version")
+        """ version of node/way/relation """
+        return self.attribs.get("version")
 
-    def __init__(self, attrib={}, tag={}):
-        OSMElement.__init__(self, attrib, tag)
+    def __init__(self, attribs={}, tags={}):
+        OSMElement.__init__(self, attribs, tags)
         self.history = {}
         if self.version is not None:
             self.history[self.version] = self
@@ -1893,6 +1874,7 @@ class Node(OSMPrimitive):
         Node != Node
 
     Attributes:
+        xml_tag     --- XML tag of the element.
         lat         --- Latitude of the node.
         lon         --- Longitude of the node.
 
@@ -1901,6 +1883,7 @@ class Node(OSMPrimitive):
 
     """
 
+    xml_tag = "node"
     _counter = 0
 
     @classmethod
@@ -1914,21 +1897,21 @@ class Node(OSMPrimitive):
         """
         if not ET.iselement(data):
             data = XML(data)
-        attrib = cls.parse_attribs(data)
-        tag = cls.parse_tags(data)
-        return cls(attrib, tag)
+        attribs = cls.parse_attribs(data)
+        tags = cls.parse_tags(data)
+        return cls(attribs, tags)
 
-    def __init__(self, attrib={}, tag={}):
-        OSMPrimitive.__init__(self, attrib, tag)
+    def __init__(self, attribs={}, tags={}):
+        OSMPrimitive.__init__(self, attribs, tags)
         if self.id is None:
             # Automatically asign id
-            Node._counter -= 1
-            self.attrib["id"] = Node._counter
+            self.__class__._counter -= 1
+            self.attribs["id"] = self.__class__._counter
 
     def __eq__(self, other):
         if not isinstance(other, Node):
             return NotImplemented
-        return self.id == other.id and self.version == other.version and self.tag == other.tag and self.lat == other.lat and self.lon == other.lon
+        return self.id == other.id and self.version == other.version and self.tags == other.tags and self.lat == other.lat and self.lon == other.lon
 
     def __ne__(self, other):
         if not isinstance(other, Node):
@@ -1937,19 +1920,19 @@ class Node(OSMPrimitive):
 
     @property
     def lat(self):
-        return self.attrib.get("lat")
+        return self.attribs.get("lat")
 
     @lat.setter
     def lat(self, value):
-        self.attrib["lat"] = float(value)
+        self.attribs["lat"] = float(value)
 
     @property
     def lon(self):
-        return self.attrib.get("lon")
+        return self.attribs.get("lon")
 
     @lon.setter
     def lon(self, value):
-        self.attrib["lon"] = float(value)
+        self.attribs["lon"] = float(value)
 
 
 class Way(OSMPrimitive):
@@ -1966,13 +1949,15 @@ class Way(OSMPrimitive):
         parse_nds   --- Extract list of node ids of the way from ET.Element.
 
     Attributes:
-        nd          --- List of node ids of the way.
+        xml_tag     --- XML tag of the element.
+        nds         --- List of node ids of the way.
 
     Methods:
         to_xml      --- Get ET.Element representation of wrapper.
 
     """
 
+    xml_tag = "way"
     _counter = 0
 
     @classmethod
@@ -1986,10 +1971,10 @@ class Way(OSMPrimitive):
         """
         if not ET.iselement(data):
             data = XML(data)
-        attrib = cls.parse_attribs(data)
-        tag = cls.parse_tags(data)
-        nd = cls.parse_nds(data)
-        return cls(attrib, tag, nd)
+        attribs = cls.parse_attribs(data)
+        tags = cls.parse_tags(data)
+        nds = cls.parse_nds(data)
+        return cls(attribs, tags, nds)
 
     @classmethod
     def parse_nds(cls, element):
@@ -2005,18 +1990,18 @@ class Way(OSMPrimitive):
             nds.append(int(nd.attrib["ref"]))
         return nds
 
-    def __init__(self, attrib={}, tag={}, nd=()):
-        OSMPrimitive.__init__(self, attrib, tag)
-        self.nd = list(nd)
+    def __init__(self, attribs={}, tags={}, nds=()):
+        OSMPrimitive.__init__(self, attribs, tags)
+        self.nds = list(nds)
         if self.id is None:
             # Automatically asign id
-            Way._counter -= 1
-            self.attrib["id"] = Way._counter
+            self.__class__._counter -= 1
+            self.attribs["id"] = self.__class__._counter
 
     def __eq__(self, other):
         if not isinstance(other, Way):
             return NotImplemented
-        return self.id == other.id and self.version == other.version and self.tag == other.tag and self.nd == other.nd
+        return self.id == other.id and self.version == other.version and self.tags == other.tags and self.nds == other.nds
 
     def __ne__(self, other):
         if not isinstance(other, Way):
@@ -2026,7 +2011,7 @@ class Way(OSMPrimitive):
     def __contains__(self, item):
         if not isinstance(item, Node):
             raise NotImplementedError
-        return item.id in self.nd
+        return item.id in self.nds
 
     def to_xml(self, strip=()):
         """
@@ -2037,7 +2022,7 @@ class Way(OSMPrimitive):
 
         """
         element = OSMPrimitive.to_xml(self, strip=strip)
-        for nd in self.nd:
+        for nd in self.nds:
             ET.SubElement(element, "nd", {"ref": str(nd)})
         return element
 
@@ -2056,13 +2041,15 @@ class Relation(OSMPrimitive):
         parse_members   --- Extract list of members of the relation from ET.Element.
 
     Attributes:
-        member          --- List of relation members.
+        xml_tag         --- XML tag of the element.
+        members         --- List of relation members.
 
     Methods:
         to_xml          --- Get ET.Element representation of wrapper.
 
     """
 
+    xml_tag = "relation"
     _counter = 0
 
     @classmethod
@@ -2076,10 +2063,10 @@ class Relation(OSMPrimitive):
         """
         if not ET.iselement(data):
             data = XML(data)
-        attrib = cls.parse_attribs(data)
-        tag = cls.parse_tags(data)
-        member = cls.parse_members(data)
-        return cls(attrib, tag, member)
+        attribs = cls.parse_attribs(data)
+        tags = cls.parse_tags(data)
+        members = cls.parse_members(data)
+        return cls(attribs, tags, members)
 
     @classmethod
     def parse_members(cls, element):
@@ -2095,18 +2082,18 @@ class Relation(OSMPrimitive):
             members.append(cls.parse_attribs(member))
         return members
 
-    def __init__(self, attrib={}, tag={}, member=()):
-        OSMPrimitive.__init__(self, attrib, tag)
-        self.member = list(member)
+    def __init__(self, attribs={}, tags={}, members=()):
+        OSMPrimitive.__init__(self, attribs, tags)
+        self.members = list(members)
         if self.id is None:
             # Automatically asign id
-            Relation._counter -= 1
-            self.attrib["id"] = Relation._counter
+            self.__class__._counter -= 1
+            self.attribs["id"] = self.__class__._counter
 
     def __eq__(self, other):
         if not isinstance(other, Relation):
             return NotImplemented
-        return self.id == other.id and self.version == other.version and self.tag == other.tag and self.member == other.member
+        return self.id == other.id and self.version == other.version and self.tags == other.tags and self.members == other.members
 
     def __ne__(self, other):
         if not isinstance(other, Relation):
@@ -2116,8 +2103,8 @@ class Relation(OSMPrimitive):
     def __contains__(self, item):
         if not isinstance(item, (Node, Way, Relation)):
             raise NotImplementedError
-        for member in self.member:
-            if member["type"] == item.TAG_NAME() and memeber["ref"] == item.id:
+        for member in self.members:
+            if member["type"] == item.xml_tag and member["ref"] == item.id:
                 return True
         return False
 
@@ -2130,9 +2117,9 @@ class Relation(OSMPrimitive):
 
         """
         element = OSMPrimitive.to_xml(self, strip=strip)
-        for member in self.member:
-            attrib = self.unparse_attribs(member, strip=strip)
-            ET.SubElement(element, "member", attrib)
+        for member in self.members:
+            attribs = self.unparse_attribs(member, strip=strip)
+            ET.SubElement(element, "member", attribs)
         return element
 
 
@@ -2141,9 +2128,14 @@ class Changeset(OSMElement):
     Changeset wrapper.
 
     Class methods:
-        from_xml        --- Create Relation wrapper from XML representation.
+        from_xml        --- Create Changeset wrapper from XML representation.
+
+    Attributes:
+        xml_tag         --- XML tag of the element.
 
     """
+
+    xml_tag = "changeset"
 
     @classmethod
     def from_xml(cls, data):
@@ -2156,25 +2148,28 @@ class Changeset(OSMElement):
         """
         if not ET.iselement(data):
             data = XML(data)
-        attrib = cls.parse_attribs(data)
-        tag = cls.parse_tags(data)
-        return cls(attrib, tag)
+        attribs = cls.parse_attribs(data)
+        tags = cls.parse_tags(data)
+        return cls(attribs, tags)
 
 
-class OSM(XMLElement, MutableSet):
+class OSM(XMLElement, XMLFile, MutableSet):
     """
-    OSM XML document wrapper. Essentially a mutable set of Node, Way, Relation instances.
+    OSM XML document wrapper. Essentially a mutable set of Node, Way, Relation wrappers.
 
     Class methods:
-        from_xml        --- Create OSM XML document wrapper from XML representation.
+        from_xml    --- Create OSM XML document wrapper from XML representation.
 
     Attributes:
-        node        --- Dictionary of nodes {nodeId: Node}.
-        way         --- Dictionary of ways {wayId: Way}.
-        relation    --- Dictionary of relations {relationId: Relation}.
+        nodes       --- Dictionary of nodes {nodeId: Node}.
+        ways        --- Dictionary of ways {wayId: Way}.
+        relations   --- Dictionary of relations {relationId: Relation}.
 
     Methods:
-        to_xml          --- Get ET.Element representation of wrapper.
+        to_xml      --- Get ET.Element representation of wrapper.
+        node        --- Retrieve Node wrapper by id or None.
+        way         --- Retrieve Way wrapper by id or None.
+        relation    --- Retrieve Relation wrapper by id or None.
 
     """
 
@@ -2189,48 +2184,46 @@ class OSM(XMLElement, MutableSet):
         """
         if not ET.iselement(data):
             data = ET.XML(data)
-        node = {}
-        way = {}
-        relation = {}
-        for elem_cls, container in ((Node, node), (Way, way), (Relation, relation)):
-            for element in data.findall(elem_cls.TAG_NAME()):
-                element = elem_cls.from_xml(element)
-                if element.id in container:
-                    container[element.id] = container[element.id].merge_history(element)
+        containers = {"node": {}, "way": {}, "relation": {}}
+        for elem_type in containers.keys():
+            for element in data.findall(elem_type):
+                element = wrappers[elem_type].from_xml(element)
+                if element.id in containers[elem_type]:
+                    containers[elem_type][element.id] = containers[elem_type][element.id].merge_history(element)
                 else:
-                    container[element.id] = element
-        return cls(chain(node.values(), way.values(), relation.values()))
+                    containers[elem_type][element.id] = element
+        return cls(chain(containers["node"].values(), containers["way"].values(), containers["relation"].values()))
 
     def __init__(self, items=()):
-        self.node = {}
-        self.way = {}
-        self.relation = {}
+        self.nodes = {}
+        self.ways = {}
+        self.relations = {}
         for item in items:
             self.add(item)
 
     def __len__(self):
-        return len(self.node) + len(self.way) + len(self.relation)
+        return len(self.nodes) + len(self.ways) + len(self.relations)
 
     def __iter__(self):
-        return chain(self.node.values(), self.way.values(), self.relation.values())
+        return chain(self.nodes.values(), self.ways.values(), self.relations.values())
 
     def __contains__(self, item):
         if not isinstance(item, (Node, Way, Relation)):
             raise NotImplementedError
-        for container, cls in ((self.node, Node), (self.way, Way), (self.relation, Relation)):
+        for container, cls in ((self.nodes, Node), (self.ways, Way), (self.relations, Relation)):
             if isinstance(item, cls):
                 return container.get(item.id) == item
         return False
 
     def add(self, item):
-        for container, cls in ((self.node, Node), (self.way, Way), (self.relation, Relation)):
+        for container, cls in ((self.nodes, Node), (self.ways, Way), (self.relations, Relation)):
             if isinstance(item, cls):
                 container[item.id] = item
                 return
         raise ValueError("Only Node, Way, Relation instances are allowed.")
 
     def discard(self, item):
-        for container, cls in ((self.node, Node), (self.way, Way), (self.relation, Relation)):
+        for container, cls in ((self.nodes, Node), (self.ways, Way), (self.relations, Relation)):
             if isinstance(item, cls):
                 container.pop(item.id, None)
                 return
@@ -2241,22 +2234,52 @@ class OSM(XMLElement, MutableSet):
         Get ET.Element representation of wrapper.
 
         Keyworded arguments:
-            strip       --- Attributes that should be filtered out.
+            strip   --- Attributes that should be filtered out.
 
         """
-        element = ET.Element("osm", {"version": str(API.version), "generator": "osmt"})
+        element = ET.Element("osm", {"version": str(API.version), "generator": "osmapis"})
         for child in self:
             element.append(child.to_xml(strip=strip))
         return element
 
+    def node(self, id_):
+        """
+        Retrieve Node wrapper by id or None.
 
-class OSC(XMLElement):
+        Arguments:
+            id_     --- Id of the Node wrapper.
+
+        """
+        return self.nodes.get(id_)
+
+    def way(self, id_):
+        """
+        Retrieve Way wrapper by id or None.
+
+        Arguments:
+            id_     --- Id of the Way wrapper.
+
+        """
+        return self.ways.get(id_)
+
+    def relation(self, id_):
+        """
+        Retrieve Relation wrapper by id or None.
+
+        Arguments:
+            id_     --- Id of the Relation wrapper.
+
+        """
+        return self.relations.get(id_)
+
+
+class OSC(XMLElement, XMLFile):
     """
     OSC XML document wrapper.
 
     Class methods:
-        from_diff       --- Create OSC XML document wrapper by diffing two OSM instances.
-        from_xml        --- Create OSC XML document wrapper from XML representation.
+        from_diff   --- Create OSC XML document wrapper by diffing two OSM instances.
+        from_xml    --- Create OSC XML document wrapper from XML representation.
 
     Attributes:
         create      --- OSM instance containing elements to create.
@@ -2264,7 +2287,7 @@ class OSC(XMLElement):
         delete      --- OSM instance containing elements to delete.
 
     Methods:
-        to_xml          --- Get ET.Element representation of wrapper.
+        to_xml      --- Get ET.Element representation of wrapper.
 
     """
 
@@ -2284,8 +2307,8 @@ class OSC(XMLElement):
         modify = set()
         delete = set()
         for type_ in ("node", "way", "relation"):
-            parent_elements = getattr(parent, type_)
-            child_elements = getattr(child, type_)
+            parent_elements = getattr(parent, type_ + "s")
+            child_elements = getattr(child, type_ + "s")
             for id_ in set(child_elements.keys()) | set(parent_elements.keys()):
                 if id_ not in child_elements:
                     delete.add(parent_elements[id_])
@@ -2306,18 +2329,18 @@ class OSC(XMLElement):
         """
         if not ET.iselement(data):
             data = ET.XML(data)
-        create = OSM()
-        modify = OSM()
-        delete = OSM()
+        create = wrappers["osm"]()
+        modify = wrappers["osm"]()
+        delete = wrappers["osm"]()
         for elem_name, container in (("create", create), ("modify", modify), ("delete", delete)):
             for element in data.findall(elem_name):
-                container |= OSM.from_xml(element)
+                container |= wrappers["osm"].from_xml(element)
         return cls(create, modify, delete)
 
     def __init__(self, create=(), modify=(), delete=()):
-        self.create = OSM(create)
-        self.modify = OSM(modify)
-        self.delete = OSM(delete)
+        self.create = wrappers["osm"](create)
+        self.modify = wrappers["osm"](modify)
+        self.delete = wrappers["osm"](delete)
 
     def to_xml(self, strip=()):
         """
@@ -2327,7 +2350,7 @@ class OSC(XMLElement):
             strip       --- Attributes that should be filtered out.
 
         """
-        element = ET.Element("osmChange", {"version":str(API.version), "generator":"osmt"})
+        element = ET.Element("osmChange", {"version":str(API.version), "generator":"osmapis"})
         for action in ("create", "modify", "delete"):
             action_element = getattr(self, action).to_xml(strip=strip)
             if len(action_element.getchildren()) > 0:
@@ -2335,6 +2358,16 @@ class OSC(XMLElement):
                 action_element.attrib = {}
                 element.append(action_element)
         return element
+
+"""
+Dictionary containing the classes to use for OSM element wrappers.
+
+This is the place, where you can set customized wrapper classes.
+WARNING: Customized classes should always inherit from the default ones,
+         otherwise BAD things will happen!
+"""
+wrappers = {"node": Node, "way": Way, "relation": Relation,
+            "changeset": Changeset, "osm": OSM, "osc": OSC}
 
 
 
@@ -2347,23 +2380,20 @@ class APIError(Exception):
     OSM API exception.
 
     Attributes:
-        status      --- HTTP status code returned by API.
-        reason      --- The reason for returned status code.
+        reason      --- The reason of failure.
         payload     --- Data sent to API with request.
 
     """
 
-    def __init__(self, status, reason, payload):
+    def __init__(self, reason, payload):
         """
         Arguments:
-            status      --- HTTP status code returned by API.
-            reason      --- The reason for returned status code.
+            reason      --- The reason of failure.
             payload     --- Data sent to API with request.
 
         """
-        self.status = status
         self.reason = reason
         self.payload = payload
 
     def __str__(self):
-        return "Request failed: {} ({}) << {}".format(self.status, self.reason, self.payload)
+        return "Request failed: {}".format(self.reason)
