@@ -17,6 +17,7 @@ from gettext import translation
 import logging
 from math import sqrt
 import os.path
+import re
 
 from colterm import *
 from dbfpy.dbf import Dbf
@@ -70,13 +71,14 @@ class Places(object):
 
     pop_city = 90000
     pop_town = 3000
-    pop_village = 300
+    pop_village = 50
     pop_neighbourhood = 1
+    fix_name = re.compile(u"(.*) \(([^)]+)\)", re.I)
 
-    def __init__(self, ref=None):
+    def __init__(self, ref=""):
         self.data = {}
 
-        if ref is not None:
+        if ref != "":
             log.debug(_("Loading UIR-ZSJ data for {}.").format(ref))
         else:
             log.debug(_("Loading all UIR-ZSJ data."))
@@ -110,6 +112,10 @@ class Places(object):
             place = {"name": row[col_name].decode("cp852"), "population": row[col_pop], "xy": (row[col_x], row[col_y])}
             if name == "ZSJ":
                 place["COBE"] = row["KOD_CAST"]
+            match = self.fix_name.search(place["name"])
+            if match is not None:
+                place["name"] = match.group(1)
+                place["note"] = match.group(2)
             if ref_key is None:
                 dataset[place_ref] = place
             else:
@@ -121,7 +127,7 @@ class Places(object):
         self.data[name] = dataset
 
     def get_radius(self, place):
-        return 47 * place["population"]**0.37
+        return 39 * place["population"]**0.39 + 200
 
     def get_places(self, ref):
         if ref not in self.data["OBCE"]:
