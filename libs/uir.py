@@ -162,7 +162,9 @@ class Places(object):
                     place = dict(place)
                     place["ref:cobe"] = place_ref
                     place["radius"] = self.get_radius(place)
-                    if is_separate:
+                    if place["population"] == 0:
+                        place["place"] = "locality"
+                    elif is_separate:
                         if place["population"] > self.pop_village:
                             place["place"] = "village"
                         else:

@@ -422,7 +422,7 @@ class Import(object):
         pop = self.uir.data["OBCE"][self.rel_ref]["population"] - reduce_obce
         if pop < 0:
             log.error(u"Doplneni population pro uzel obce {} ({}) selhalo kvuli zaporne hodnote {}, kde udelali soudruzi z NDR chybu?".format(admin_centre.id, admin_centre.tags["name"], pop))
-        else:
+        elif pop > 0:
             admin_centre.tags["population"] = str(pop)
             log.info(u"Doplnuji population={} pro uzel obce {} ({}).".format(admin_centre.tags["population"], admin_centre.id, admin_centre.tags["name"]))
 
