@@ -17,6 +17,8 @@ import logging
 import os.path
 from pyproj import Proj, transform
 import re
+from time import sleep
+import unicodedata
 
 from colterm import *
 import uir
@@ -60,10 +62,65 @@ class PlaceNode(osmapis.Node):
     def xy(self):
         return wgs2jtsk(self.lon, self.lat)
 
+    @property
+    def name(self):
+        return self.tags.get("name:cs") or self.tags.get("name")
+
+
+def to_ascii(msg):
+    return unicodedata.normalize('NFKD', unicode(msg)).encode('ascii', 'ignore').lower()
+
+
+class Reporter(object):
+    place_msg = {"OBCE": u"obce", "COBE": u"části obce", "ZSJ": u"ZSJ"}
+
+    def __init__(self, uir):
+        self.uir = uir
+
+    def set_obce(self, osm_id, ref):
+        self.osm_id = osm_id
+        self.ref = ref
+        log.notice(u"Pripravuji data pro {} (relace {}).".format(self.uir.data["OBCE"][ref]["name"], osm_id))
+
+    def admin_centre_name_mismatch(self, admin_centre):
+        log.error(u"OSM data uvadi jako admin_centre uzel {} ({}), ale UIR-ZSJ data uvádí {}.".format(admin_centre.id, admin_centre.name, self.uir.data["OBCE"][self.ref]["name"]))
+
+    def add_place(self, place, match, entity=None, attr={}):
+        if place is None:
+            return None
+        msg = u"Uzel {} {} ({}): {{}}.".format(self.place_msg[entity], place.tags["name"], place.tags["place"])
+        if match is None:
+            log.warn(msg.format(u"nenalezen v OSM datech"))
+            return None
+        else:
+            parts = [u"odpovídá uzlu {} ({}, vzdálenost {}m)".format(match.id, match.tags["place"], attr["dist"])]
+            if len(match.refs["way"]) > 0:
+                parts.append(u"uzel {} je součástí cest {}".format(match.id, ", ".join(str(ref.id) for ref in match.refs["way"])))
+            if len(match.refs["relation"]) > 0:
+                parts.append(u"uzel {} je součástí relací {}".format(match.id, ", ".join(str(ref.id) for ref in match.refs["relation"])))
+            if len(parts) <= 1 and len(attr["tags_odbl"]) == 0:
+                if match.odbl_problems is not None:
+                    parts.append(u"uzel {} není kompatibilní s ODbL (ale neobsahuje důležité tagy)".format(match.id))
+                log.info(msg.format(u", ".join(parts)))
+                return None
+            else:
+                if match.odbl_problems is not None:
+                    parts.append(u"uzel {} není kompatibilní s ODbL".format(match.id))
+                log.error(msg.format(u", ".join(parts)))
+                return u", ".join(parts)
+
+    def add_unmatched(self, places):
+        unmatched = defaultdict(list)
+        for node in places:
+            self.add_place(None, node)
+            unmatched[node.tags["place"]].append(u"{} ({})".format(node.id, node.tags["name"]))
+        for place, items in unmatched.items():
+            log.error(u"Uzly s tagem place={}, které nebyly nalezeny v UIR-ZSJ datech: {}.".format(place, ", ".join(items)))
+
 
 class Places(osmapis.OSM):
-    tags_harmless = re.compile("^(created_by|name|place|population|lau[12]|(source|is_in).*)$", re.I)
-    tags_ignore = re.compile("^(created_by|name|place|population|source(:population)?|ref:(cobe|zsj)|lau[12])$", re.I)
+    tags_harmless = re.compile("^(created_by|name|place|population|fixme|note|ref|lau[12]|(source|is_in).*)$", re.I)
+    tags_ignore = re.compile("^(created_by|name|place|population|fixme|source(:population)?|ref:(cobe|zsj)|lau[12])$", re.I)
 
     dist_shift = 30
     dist_obce = 3000
@@ -71,23 +128,22 @@ class Places(osmapis.OSM):
     dist_zsj = 1000
 
     def export(self, container, data):
-        self.stats = {"match": {}, "distance": defaultdict(list), "tags_odbl": defaultdict(int)}
         self.odbl_problems()
         self.build_refs(container)
         self.export_obce(container, data["OBCE"])
         self.export_cobe(container, data["COBE"])
         self.export_zsj(container, data["ZSJ"])
-        unmatched = defaultdict(list)
-        for node in self.nodes.values():
-            self.stats["match"].setdefault(None, defaultdict(list))[node.tags["place"]].append(node.tags["name"])
-            unmatched[node.tags["place"]].append(u"{} ({})".format(node.id, node.tags["name"]))
-        for place, items in unmatched.items():
-            log.error(u"Uzly s tagem place={}, ktere nebyly nalezeny v UIR-ZSJ datech: {}.".format(place, ", ".join(items)))
+        self.reporter.add_unmatched(self.nodes.values())
         return container | self
 
-    def odbl_problems(self):
+    def odbl_problems(self, wait=1):
         log.debug("Analyzuji licenci pro uzly sidel.")
-        qhs.problems(self)
+        try:
+            qhs.problems(self)
+        except osmapis.APIError:
+            log.warn("Nepodarilo se overit licencni problemy uzlu... zkusim znovu za {}s.".format(wait))
+            sleep(wait)
+            self.odbl_problems(min(300, wait*2))
 
     def build_refs(self, container):
         for node in self.nodes.values():
@@ -109,59 +165,37 @@ class Places(osmapis.OSM):
         match = self.find_obce(place)
         if place.pop("shift", False):
             place["xy"] = (place["xy"][0], place["xy"][1] + self.dist_shift)
-        msg = u"Uzel obce {} ({}): {{}}.".format(place["name"], place["place"])
-        self.export_place(container, place, match, msg)
+        self.export_place(container, place, match, "OBCE")
 
     def export_cobe(self, container, places):
         for place in places:
             match = self.find_cobe(place)
             if place.pop("shift", False):
                 place["xy"] = (place["xy"][0], place["xy"][1] - self.dist_shift)
-            msg = u"Uzel casti obce {} ({}): {{}}.".format(place["name"], place["place"])
-            self.export_place(container, place, match, msg)
+            self.export_place(container, place, match, "COBE")
 
     def export_zsj(self, container, places):
         for place in places:
             match = self.find_zsj(place)
-            msg = u"Uzel ZSJ {} ({}): {{}}.".format(place["name"], place["place"])
-            self.export_place(container, place, match, msg)
+            self.export_place(container, place, match, "ZSJ")
 
     def find_obce(self, place):
-        if place["name"].lower() == self.admin_centre.tags["name"].lower() and uir.distance(place["xy"], self.admin_centre.xy) < self.dist_obce:
+        if to_ascii(place["name"]) == to_ascii(self.admin_centre.name):
             return self.admin_centre
-        log.error(u"OSM data uvadi jako admin_centre uzel {} ({}), ale UIR-ZSJ data rikaji {}.".format(self.admin_centre.id, self.admin_centre.tags["name"], place["name"]))
-        score = self.dist_obce
-        match = None
-        for node in self.nodes.values():
-            if place["name"].lower() != node.tags["name"].lower():
-                continue
-            dist = uir.distance(place["xy"], node.xy)
-            if dist > score:
-                continue
-            score = dist
-            match = node
-        return match
+        self.reporter.admin_centre_name_mismatch(self.admin_centre)
+        return self.find_by_name(place, self.dist_obce) or self.find_by_ascii_name(place, self.dist_obce)
 
     def find_cobe(self, place):
-        return self.find_cobe_zsj(place, self.dist_cobe, "ref:cobe")
+        return self.find_by_ref(place, self.dist_cobe, "ref:cobe") or self.find_by_name(place, self.dist_cobe) or self.find_by_ascii_name(place, self.dist_cobe)
 
     def find_zsj(self, place):
-        return self.find_cobe_zsj(place, self.dist_zsj, "ref:zsj")
+        return self.find_by_ref(place, self.dist_cobe, "ref:zsj") or self.find_by_name(place, self.dist_cobe) or self.find_by_ascii_name(place, self.dist_cobe)
 
-    def find_cobe_zsj(self, place, score, ref_key):
+    def find_by_ref(self, place, score, ref_key):
+        place_ref = place[ref_key]
         match = None
         for node in self.nodes.values():
-            if node.tags.get(ref_key) != place[ref_key]:
-                continue
-            dist = uir.distance(node.xy, place["xy"])
-            if dist > score:
-                continue
-            score = dist
-            match = node
-        if match is not None:
-            return match
-        for node in self.nodes.values():
-            if node.tags.get("name").lower() != place["name"].lower():
+            if node.tags.get(ref_key) != place_ref:
                 continue
             dist = uir.distance(node.xy, place["xy"])
             if dist > score:
@@ -170,7 +204,33 @@ class Places(osmapis.OSM):
             match = node
         return match
 
-    def export_place(self, export, place, match, msg):
+    def find_by_name(self, place, score):
+        place_name = place["name"].lower()
+        match = None
+        for node in self.nodes.values():
+            if node.name.lower() != place_name:
+                continue
+            dist = uir.distance(node.xy, place["xy"])
+            if dist > score:
+                continue
+            score = dist
+            match = node
+        return match
+
+    def find_by_ascii_name(self, place, score):
+        place_name = to_ascii(place["name"])
+        match = None
+        for node in self.nodes.values():
+            if to_ascii(node.name) != place_name:
+                continue
+            dist = uir.distance(node.xy, place["xy"])
+            if dist > score:
+                continue
+            score = dist
+            match = node
+        return match
+
+    def export_place(self, export, place, match, entity):
         tags = dict(place)
         tags.pop("COBE", None)
         tags.pop("radius", None)
@@ -178,58 +238,53 @@ class Places(osmapis.OSM):
         tags["source"] = "csu:uir-zsj"
         place = PlaceNode.from_jtsk(tags.pop("xy"), tags)
         if match is None:
-            self.stats["match"].setdefault(place.tags["place"], defaultdict(list))[None].append(place.tags["name"])
-            log.warn(msg.format("nenalezen v OSM datech"))
+            self.reporter.add_place(place, match, entity)
             export.add(place)
         else:
             self.remove(match)
-            d = int(round(uir.distance(place.xy, match.xy)))
-            self.stats["match"].setdefault(place.tags["place"], defaultdict(list))[match.tags["place"]].append(place.tags["name"])
-            self.stats["distance"][place.tags["place"]].append(d)
-            parts = ["odpovida uzlu {} ({}, vzdalenost {}m)".format(match.id, match.tags["place"], d)]
-            if len(match.refs["way"]) > 0:
-                parts.append("uzel {} je soucasti cest {}".format(match.id, ", ".join(str(ref) for ref in match.refs["way"])))
-            if len(match.refs["relation"]) > 0:
-                parts.append("uzel {} je soucasti relaci {}".format(match.id, ", ".join(str(ref) for ref in match.refs["relation"])))
+            attr = {"tags_odbl": set(), "dist": int(round(uir.distance(place.xy, match.xy)))}
             if match.odbl_problems is not None:
-                relevant_tags = set(filter(lambda k: self.tags_harmless.match(k) is None, match.tags.keys()))
-                if len(parts) <= 1 and len(relevant_tags) == 0:
+                attr["tags_odbl"] = set(filter(lambda k: self.tags_harmless.match(k) is None, match.tags.keys()))
+                if len(match.refs["way"]) == 0 and len(match.refs["relation"]) == 0 and len(attr["tags_odbl"]) == 0:
+                    self.reporter.add_place(place, match, entity, attr)
                     export.add(place)
-                    parts.append("uzel {} neni kompatibilni s ODbL (ale neobsahuje zadne dulezite tagy)".format(match.id))
-                    log.info(msg.format(", ".join(parts)))
-                else:
-                    parts.append("uzel {} neni kompatibilni s ODbL".format(match.id))
-                    if len(relevant_tags) > 0:
-                        self.stats["tags_odbl"][None] += 1
-                        for tag in relevant_tags:
-                            self.stats["tags_odbl"][tag] += 1
             if place not in export:
-                if len(parts) > 1:
+                if len(match.refs["way"]) > 0 or len(match.refs["relation"]) > 0 or match.odbl_problems is not None:
+                    place.tags["fixme"] = self.reporter.add_place(place, match, entity, attr)
                     if match.odbl_problems is None:
                         self.merge_tags(match, place)
-                    place.tags["fixme"] = ", ".join(parts)
                     export.add(match)
                     export.add(place)
-                    log.error(msg.format(", ".join(parts)))
                 else:
+                    self.reporter.add_place(place, match, entity, attr)
                     self.merge_tags(match, place)
                     for k, v in match.attribs.items():
                         if k not in ("lat", "lon"):
                             place.attribs[k] = v
                     export.add(place)
-                    log.info(msg.format(", ".join(parts)))
 
             for adm_rel in match.refs["admin"]:
                 for member in adm_rel.members:
                     if member["role"] == "admin_centre" and member["ref"] == match.id:
                         member["ref"] = place.id
 
+        if entity == "OBCE" and match != self.admin_centre:
+            for member in export.relations[self.rel_id].members:
+                if member["type"] == "node" and member["role"] == "admin_centre":
+                    member["ref"] = place.id
+            self.admin_centre.refs["admin"].remove(export.relations[self.rel_id])
+
     def merge_tags(self, match, place):
-        if place.tags["place"] in ("suburb", "neighbourhood") and match.tags["place"] in ("village", "hamlet"):
+        if place.tags["place"] in ("suburb", "neighbourhood") and match.tags["place"] in ("village", "hamlet", "isolated_dwelling"):
             place.tags["place"] = match.tags["place"]
+        if match.tags.get("name:cs", "").lower() == place.tags["name"].lower():
+            place.tags["name"] = match.tags["name"]
         for k, v in match.tags.items():
             if self.tags_ignore.match(k) is None:
-                place.tags[k] = v
+                if k == "note" and "note" in place.tags:
+                    place.tags["note"] = u"{}, {}".format(place.tags["note"], v)
+                else:
+                    place.tags[k] = v
 
 
 osmapis.wrappers["node"] = PlaceNode
@@ -254,6 +309,8 @@ class Import(object):
         self.rel_id = relation.id
         self.rel_ref = relation.tags["ref"]
         self.uir = uir.Places(self.rel_ref)
+        self.reporter = Reporter(self.uir)
+        Places.reporter = self.reporter
 
     def download_by_ref(self, ref):
         query = '<query type="relation"><has-kv k="type" v="boundary"/><has-kv k="boundary" v="administrative"/><has-kv k="admin_level" v="8"/><has-kv k="ref" v="{}"/></query><print order="quadtile"/>'.format(ref)
@@ -314,7 +371,8 @@ class Import(object):
         data, places = self.download_osm_data(simple)
         data.save(os.path.join(os.path.dirname(__file__), "..", "tmp", "{}.osm".format(self.rel_id)))
         data -= places
-        log.notice(u"Pripravuji data pro {} (relace {}).".format(self.uir.data["OBCE"][self.rel_ref]["name"], self.rel_id))
+        places.rel_id = self.rel_id
+        places.reporter.set_obce(self.rel_id, self.rel_ref)
         export = places.export(osmapis.OSM(data), self.uir.get_places(self.rel_ref))
         filename = os.path.join(os.path.dirname(__file__), "..", "import", "{}.osm".format(self.rel_id))
         export.save(filename)
