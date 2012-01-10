@@ -120,7 +120,7 @@ class Reporter(object):
 
 class Places(osmapis.OSM):
     tags_harmless = re.compile("^(created_by|name|place|population|fixme|note|ref|lau[12]|(source|is_in).*)$", re.I)
-    tags_ignore = re.compile("^(created_by|name|place|population|fixme|source(:population)?|ref:(cobe|zsj)|lau[12])$", re.I)
+    tags_ignore = re.compile("^(created_by|name|place|population|source(:population)?|ref:(cobe|zsj)|lau[12])$", re.I)
 
     dist_shift = 30
     dist_obce = 3000
