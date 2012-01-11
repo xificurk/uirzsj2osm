@@ -398,28 +398,34 @@ class Import(object):
                 continue
             log.warn(u"Nepodarilo se doplnit population tag pro uzel {} ({}) place={}.".format(node.id, node.tags["name"], node.tags["place"]))
             places.remove(node)
-        reduce_cobe = defaultdict(int)
+        pop_reduce = defaultdict(int)
         for node in places.nodes.values():
             if node == admin_centre or "ref:cobe" in node.tags:
                 continue
-            uir_node = self.uir.data["ZSJ"][self.rel_ref][node.tags["ref:zsj"]]
-            node.tags["population"] = str(uir_node["population"])
-            reduce_cobe[uir_node["COBE"]] += uir_node["population"]
+            pop = 0
+            for ref in node.tags["ref:zsj"].split(";"):
+                uir_node = self.uir.data["ZSJ"][self.rel_ref][ref]
+                pop += uir_node["population"]
+                pop_reduce[uir_node["COBE"]] += uir_node["population"]
+            pop_reduce["OBCE"] += pop
+            node.tags["population"] = str(pop)
             log.info(u"Doplnuji population={} pro uzel ZSJ {} ({}).".format(node.tags["population"], node.id, node.tags["name"]))
             places.remove(node)
-        reduce_obce = sum(val for val in reduce_cobe.values())
         for node in places.nodes.values():
             if node == admin_centre:
                 continue
-            pop = self.uir.data["COBE"][self.rel_ref][node.tags["ref:cobe"]]["population"] - reduce_cobe.get(node.tags["ref:cobe"], 0)
+            pop = 0
+            for ref in node.tags["ref:cobe"].split(";"):
+                uir_node = self.uir.data["COBE"][self.rel_ref][ref]
+                pop += uir_node["population"] - pop_reduce.get(ref, 0)
             if pop < 0:
                 log.error(u"Doplneni population pro uzel casti obce {} ({}) selhalo kvuli zaporne hodnote {}, kde udelali soudruzi z NDR chybu?".format(node.id, node.tags["name"], pop))
             else:
                 node.tags["population"] = str(pop)
-                reduce_obce += pop
+                pop_reduce["OBCE"] += pop
                 log.info(u"Doplnuji population={} pro uzel casti obce {} ({}).".format(node.tags["population"], node.id, node.tags["name"]))
             places.remove(node)
-        pop = self.uir.data["OBCE"][self.rel_ref]["population"] - reduce_obce
+        pop = self.uir.data["OBCE"][self.rel_ref]["population"] - pop_reduce["OBCE"]
         if pop < 0:
             log.error(u"Doplneni population pro uzel obce {} ({}) selhalo kvuli zaporne hodnote {}, kde udelali soudruzi z NDR chybu?".format(admin_centre.id, admin_centre.tags["name"], pop))
         elif pop > 0:
