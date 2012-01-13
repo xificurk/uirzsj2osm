@@ -379,11 +379,11 @@ class Import(object):
         return os.path.normpath(filename)
 
     def commit(self):
-        original = osmapis.OSM.load(os.path.join(os.path.dirname(__file__), "..", "tmp", "{}.osm".format(self.rel_id)))
+        self.original = osmapis.OSM.load(os.path.join(os.path.dirname(__file__), "..", "tmp", "{}.osm".format(self.rel_id)))
         export = osmapis.OSM.load(os.path.join(os.path.dirname(__file__), "..", "import", "{}.osm".format(self.rel_id)))
         self.add_population(export)
         log.notice(u"Odesilam data pro {} (relace {}).".format(self.uir.data["OBCE"][self.rel_ref]["name"], self.rel_id))
-        osc = osmapis.OSC.from_diff(original, export)
+        osc = osmapis.OSC.from_diff(self.original, export)
         self.upload(osc)
 
     def add_population(self, data):
@@ -394,8 +394,10 @@ class Import(object):
             raise SystemExit(1)
 
         for node in places.nodes.values():
-            if node == admin_centre or "ref:cobe" in node.tags or "ref:zsj" in node.tags:
+            if node == admin_centre or node.tags.get("ref:cobe") in self.uir.data["COBE"][self.rel_ref] or node.tags.get("ref:zsj") in self.uir.data["ZSJ"][self.rel_ref]:
                 continue
+            if ("ref:cobe" in node.tags or "ref:zsj" in node.tags) and node.id in self.original.nodes and "population" in self.original.nodes[node.id].tags:
+                node.tags["population"] = self.original.nodes[node.id].tags["population"]
             log.warn(u"Nepodarilo se doplnit population tag pro uzel {} ({}) place={}.".format(node.id, node.tags["name"], node.tags["place"]))
             places.remove(node)
         pop_reduce = defaultdict(int)

@@ -11,7 +11,7 @@ __author__ = "Petr Morávek (xificurk@gmail.com)"
 __copyright__ = "Copyright (C) 2009-2011 Petr Morávek"
 __license__ = "GPL 3.0"
 
-__version__ = "1.1"
+__version__ = "1.3"
 
 import logging
 from optparse import IndentedHelpFormatter, OptionGroup, OptionParser
