@@ -387,22 +387,30 @@ class Import(object):
         self.upload(osc)
 
     def add_population(self, data):
-        places = osmapis.OSM(node for node in data.nodes.values() if node.tags.get("place") in ("city", "village", "hamlet") and "name" in node.tags)
+        places = osmapis.OSM(node for node in data.nodes.values() if node.tags.get("place") in ("city", "town", "village", "hamlet") and "name" in node.tags)
         admin_centre = self.find_admin_centre(data)
         if admin_centre is None:
             log.critical("Relaci {} chybi admin_centre.".format(self.rel_id))
             raise SystemExit(1)
+        pop_reduce = defaultdict(int)
 
         for node in places.nodes.values():
-            if node == admin_centre or node.tags.get("ref:cobe") in self.uir.data["COBE"][self.rel_ref] or node.tags.get("ref:zsj") in self.uir.data["ZSJ"][self.rel_ref]:
+            if node == admin_centre:
+                continue
+            if len(set(node.tags.get("ref:cobe", "").split(";")) & set(self.uir.data["COBE"][self.rel_ref])) > 0:
+                continue
+            if len(set(node.tags.get("ref:zsj", "").split(";")) & set(self.uir.data["ZSJ"][self.rel_ref])) > 0:
                 continue
             if ("ref:cobe" in node.tags or "ref:zsj" in node.tags) and node.id in self.original.nodes and "population" in self.original.nodes[node.id].tags:
                 node.tags["population"] = self.original.nodes[node.id].tags["population"]
-            log.warn(u"Nepodarilo se doplnit population tag pro uzel {} ({}) place={}.".format(node.id, node.tags["name"], node.tags["place"]))
+            else:
+                log.warn(u"Nepodarilo se doplnit population tag pro uzel {} ({}) place={}.".format(node.id, node.tags["name"], node.tags["place"]))
             places.remove(node)
-        pop_reduce = defaultdict(int)
+
         for node in places.nodes.values():
-            if node == admin_centre or "ref:cobe" in node.tags:
+            if node == admin_centre:
+                continue
+            if len(set(node.tags.get("ref:cobe", "").split(";")) & set(self.uir.data["COBE"][self.rel_ref])) > 0:
                 continue
             pop = 0
             for ref in node.tags["ref:zsj"].split(";"):
@@ -413,6 +421,7 @@ class Import(object):
             node.tags["population"] = str(pop)
             log.info(u"Doplnuji population={} pro uzel ZSJ {} ({}).".format(node.tags["population"], node.id, node.tags["name"]))
             places.remove(node)
+
         for node in places.nodes.values():
             if node == admin_centre:
                 continue
@@ -427,6 +436,7 @@ class Import(object):
                 pop_reduce["OBCE"] += pop
                 log.info(u"Doplnuji population={} pro uzel casti obce {} ({}).".format(node.tags["population"], node.id, node.tags["name"]))
             places.remove(node)
+
         pop = self.uir.data["OBCE"][self.rel_ref]["population"] - pop_reduce["OBCE"]
         if pop < 0:
             log.error(u"Doplneni population pro uzel obce {} ({}) selhalo kvuli zaporne hodnote {}, kde udelali soudruzi z NDR chybu?".format(admin_centre.id, admin_centre.tags["name"], pop))
